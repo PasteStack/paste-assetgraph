@@ -1,43 +1,60 @@
 # paste-assetgraph Scala Runtime
 
-Scala library for reading paste-assetgraph manifests and serving assets via Akka HTTP.
+Scala library for reading paste-assetgraph manifests and serving assets via Pekko HTTP.
 
 ## Installation
 
 ```scala
-libraryDependencies += "com.pastestack" %% "paste-assetgraph" % "0.1.0"
+// Runtime library (manifest loading, combo handling)
+libraryDependencies += "com.pastestack" %% "paste-assetgraph-runtime" % "0.1.0"
+
+// Pekko HTTP routes (optional)
+libraryDependencies += "com.pastestack" %% "paste-assetgraph-pekko" % "0.1.0"
+
+// sbt plugin (add to project/plugins.sbt)
+addSbtPlugin("com.pastestack" % "paste-assetgraph-sbt" % "0.1.0")
 ```
 
 ## Usage
 
 ```scala
 import com.pastestack.assetgraph.Manifest
-import com.pastestack.assetgraph.akka.AssetRoutes
+import com.pastestack.assetgraph.pekko.PasteComboRoute
 
 // Load manifest
 val manifest = Manifest.load("public/manifest.json")
 
-// Create Akka HTTP routes
-val assetRoutes = new AssetRoutes(manifest, Paths.get("public"))
+// Create Pekko HTTP routes
+val comboRoute = PasteComboRoute.withManifest(manifest, "target/public")
 
 // Use in your server
-val routes = assetRoutes.routes ~ yourRoutes
+val routes = concat(comboRoute.route, yourRoutes)
 ```
 
 ## In Twirl Templates
 
 ```scala
-<link rel="stylesheet" href="@assetRoutes.resolve("css/main.css")">
-<script src="@assetRoutes.jamUrl(Seq("paste.dom", "paste.ui.heroscroll"))" defer></script>
+@* Generate JAM URL for JS modules *@
+<script src="@manifest.jamUrlForJs(Seq("paste.dom", "paste.ui.heroscroll"))" defer></script>
+
+@* Generate JAM URL for CSS modules *@
+<link rel="stylesheet" href="@manifest.jamUrlForCss(Seq("site.theme"))">
+
+@* Resolve individual asset paths *@
+<link rel="stylesheet" href="@manifest.resolve("css/main.css")">
 ```
 
-## Auto-download Binary
+## sbt Integration
 
-The library automatically downloads the Rust binary on first use:
+The sbt plugin automatically builds assets during compilation:
 
 ```scala
-import com.pastestack.assetgraph.Binary
+// build.sbt
+enablePlugins(AssetGraphPlugin)
 
-// Runs paste-assetgraph build
-Binary.build("paste-surface.conf")
+// Configure source directories
+assetGraphSourceDirs := Seq("src/main/assets/js", "src/main/assets/scss")
+assetGraphOutputDir := (Compile / resourceManaged).value / "public"
+assetGraphMinify := true
+assetGraphSourceMaps := true
 ```

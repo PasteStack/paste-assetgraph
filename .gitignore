@@ -10,3 +10,6 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# Snyk Security Extension - AI Rules (auto-generated)
+.windsurf/rules/snyk_rules.md
