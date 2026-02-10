@@ -74,7 +74,11 @@ maven-publish:
     - .flow-artifact-publish
   needs: ["build-rust", "test-rust", "test-sbt"]
   script:
-    - cd runtime/scala/sbt-plugin
+    - echo "=== Publishing runtime + pekko libraries ==="
+    - cd runtime/scala
+    - sbt "+runtime/publish" "+pekko/publish"
+    - echo "=== Publishing sbt-plugin ==="
+    - cd sbt-plugin
     - ls -la src/main/resources/native/linux-amd64/
     - ls -la src/main/resources/native/darwin-aarch64/
     - sbt publish
