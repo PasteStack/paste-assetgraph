@@ -6,10 +6,17 @@ Cargo.lock
 .idea/
 *.iml
 .vscode/
+.windsurf/
+
+# Secrets
+*.env
+.secure_files/*
+!.secure_files/
+!.secure_files/*.example
+cache.config
+credentials.config
+endpoint.config
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Snyk Security Extension - AI Rules (auto-generated)
-.windsurf/rules/snyk_rules.md
