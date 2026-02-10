@@ -12,7 +12,7 @@ val commonSettings = Seq(
   publishTo := Some("gitlab-maven" at
     s"https://gitlab.com/api/v4/projects/${sys.env.getOrElse("GITLAB_PUBLISH_PROJECT_ID", "70289607")}/packages/maven"),
   credentials ++= {
-    val projectCredentials = file("../../..") / ".secure_files" / ".credentials.gitlab"
+    val projectCredentials = file("../..") / ".secure_files" / ".credentials.gitlab"
     val homeCredentials = Path.userHome / ".sbt" / "gitlab-token"
 
     if (projectCredentials.exists()) {
