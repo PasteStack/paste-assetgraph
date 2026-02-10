@@ -1,0 +1,80 @@
+# Copyright (c) 2024–2026 Tomshley
+#
+# Licensed under the Apache License, Version 2.0
+
+# ---------------------------------------------------------------------------
+# Shared CI/CD templates from cicd-pipelines
+# ---------------------------------------------------------------------------
+include:
+  - project: 'tomshley/brands/global/tware/tech/products/provisioning/cicd-pipelines'
+    ref: 'v0.1.1'
+    file:
+      - '/gitlab/ci/.stages-base.yml'
+      - '/gitlab/ci/.gitflow-base.yml'
+      - '/gitlab/ci/.gitflow-branch-policy.yml'
+      - '/gitlab/ci/.sbt-runtime.yml'
+      - '/gitlab/ci/.sbt-rust-runtime.yml'
+      - '/gitlab/ci/.artifact-publish-policy.yml'
+      - '/gitlab/ci/.security-scanning.yml'
+
+variables:
+  CICD_PIPELINES_RUNNER_TAG: "0.1.1"
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+build-rust:
+  extends:
+    - .tomshley-sbt-rust-runtime
+  stage: build
+  script:
+    - cargo build --release
+    - mkdir -p runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64
+    - cp target/release/paste-assetgraph
+        runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64/paste-assetgraph
+  artifacts:
+    paths:
+      - runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64/paste-assetgraph
+    expire_in: 1 hour
+
+build-sbt:
+  extends:
+    - .tomshley-sbt-rust-runtime
+  stage: build
+  script:
+    - cd runtime/scala
+    - sbt compile
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+test-rust:
+  extends:
+    - .tomshley-sbt-rust-runtime
+  stage: test
+  needs: ["build-rust"]
+  script:
+    - cargo test
+
+test-sbt:
+  extends:
+    - .tomshley-sbt-rust-runtime
+  stage: test
+  needs: ["build-sbt"]
+  script:
+    - cd runtime/scala
+    - sbt test
+
+# ---------------------------------------------------------------------------
+# Maven Publish (sbt plugin to GitLab Package Registry)
+# ---------------------------------------------------------------------------
+maven-publish:
+  extends:
+    - .tomshley-sbt-rust-runtime
+    - .flow-artifact-publish
+  needs: ["build-rust", "test-rust", "test-sbt"]
+  script:
+    - cd runtime/scala/sbt-plugin
+    - ls -la src/main/resources/native/linux-amd64/
+    - ls -la src/main/resources/native/darwin-aarch64/
+    - sbt publish
