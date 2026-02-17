@@ -33,10 +33,11 @@ class PasteComboRoute(
   siteCssPath: String = sys.env.getOrElse("SITE_CSS_PATH", "src/main/assets/scss"),
   sitePrefix: String = sys.env.getOrElse("SITE_PREFIX", "site"),
   manifest: Option[Manifest] = None,
-  outputBasePath: String = sys.env.getOrElse("PASTE_OUTPUT_PATH", "target/public")
+  outputBasePath: String = sys.env.getOrElse("PASTE_OUTPUT_PATH", "target/public"),
+  webjarBasePath: String = sys.env.getOrElse("PASTE_WEBJAR_PATH", "target/paste-assetgraph-webjars")
 ) {
   
-  private val handler = new PasteComboHandler(pastePath, pasteElementsPath, siteJsPath, siteCssPath, sitePrefix, manifest, outputBasePath)
+  private val handler = new PasteComboHandler(pastePath, pasteElementsPath, siteJsPath, siteCssPath, sitePrefix, manifest, outputBasePath, webjarBasePath)
   
   val route: Route = pathPrefix("paste") {
     path(Segment / Remaining) { (timestamp, modulesWithExt) =>
@@ -79,8 +80,8 @@ object PasteComboRoute {
   /**
    * Create route with manifest for module lookup (preferred).
    */
-  def withManifest(manifest: Manifest, outputBasePath: String = "target/public"): PasteComboRoute = 
-    new PasteComboRoute(manifest = Some(manifest), outputBasePath = outputBasePath)
+  def withManifest(manifest: Manifest, outputBasePath: String = "target/public", webjarBasePath: String = "target/paste-assetgraph-webjars"): PasteComboRoute = 
+    new PasteComboRoute(manifest = Some(manifest), outputBasePath = outputBasePath, webjarBasePath = webjarBasePath)
   
   /**
    * Create route with custom paths.
@@ -89,11 +90,21 @@ object PasteComboRoute {
     new PasteComboRoute(pastePath, pasteElementsPath)
   
   /**
+   * Create route with custom paths and webjar base path.
+   */
+  def apply(pastePath: String, pasteElementsPath: String, webjarBasePath: String): PasteComboRoute = 
+    new PasteComboRoute(pastePath, pasteElementsPath, webjarBasePath = webjarBasePath)
+  
+  /**
    * Create route with manifest and fallback paths.
    */
   def apply(manifest: Manifest, pastePath: String, pasteElementsPath: String): PasteComboRoute = 
     new PasteComboRoute(pastePath, pasteElementsPath, manifest = Some(manifest))
   
-  def apply(manifest: Manifest, pastePath: String, pasteElementsPath: String, outputBasePath: String): PasteComboRoute = 
-    new PasteComboRoute(pastePath, pasteElementsPath, manifest = Some(manifest), outputBasePath = outputBasePath)
+  /**
+   * Create route with manifest, fallback paths, output path, and webjar path.
+   * Note: For custom webjarBasePath only, use the 3-arg version with named parameters.
+   */
+  def apply(manifest: Manifest, pastePath: String, pasteElementsPath: String, outputBasePath: String, webjarBasePath: String = "target/paste-assetgraph-webjars"): PasteComboRoute = 
+    new PasteComboRoute(pastePath, pasteElementsPath, manifest = Some(manifest), outputBasePath = outputBasePath, webjarBasePath = webjarBasePath)
 }

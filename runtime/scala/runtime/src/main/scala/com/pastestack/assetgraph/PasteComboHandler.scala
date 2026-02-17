@@ -38,11 +38,15 @@ class PasteComboHandler(
   siteCssPath: String = sys.env.getOrElse("SITE_CSS_PATH", "src/main/assets/scss"),
   sitePrefix: String = sys.env.getOrElse("SITE_PREFIX", "site"),
   manifest: Option[Manifest] = None,
-  outputBasePath: String = sys.env.getOrElse("PASTE_OUTPUT_PATH", "target/public")
+  outputBasePath: String = sys.env.getOrElse("PASTE_OUTPUT_PATH", "target/public"),
+  webjarBasePath: String = sys.env.getOrElse("PASTE_WEBJAR_PATH", "target/paste-assetgraph-webjars")
 ) {
   
   // Regex to parse @requires comments: @requires paste/dom -> paste.dom
   private val RequiresPattern: Regex = """@requires\s+([\w/]+)""".r
+  
+  // Cache webjar SCSS paths at construction time to avoid filesystem traversal on every compile
+  private lazy val webjarIncludePaths: Seq[String] = computeWebjarScssPaths()
   
   // Cache for parsed dependencies: module -> (deps, fileLastModified)
   // Thread-safe: accessed concurrently from Pekko HTTP request handlers
@@ -294,6 +298,10 @@ class PasteComboHandler(
   /**
    * Compile SCSS to CSS on-the-fly using the sass CLI.
    * Caches results to avoid recompilation on every request.
+   * 
+   * NOTE: Cache invalidation is based on the main SCSS file's lastModified timestamp.
+   * If webjar SCSS dependencies change (e.g., dependency version update), the cache
+   * will not automatically invalidate. Call clearCaches() to force recompilation.
    */
   private def compileScssToCss(scssPath: Path, content: String): Option[String] = {
     val lastMod = Try(Files.getLastModifiedTime(scssPath).toMillis).getOrElse(0L)
@@ -304,10 +312,11 @@ class PasteComboHandler(
         Try {
           import scala.sys.process._
           val parentPath = Option(Paths.get(pasteElementsPath).getParent).map(_.toString)
+          
           val includePaths = (Seq(
             pasteElementsPath,
             siteCssPath
-          ) ++ parentPath.toSeq).flatMap(p => Seq("--load-path", p))
+          ) ++ parentPath.toSeq ++ webjarIncludePaths).flatMap(p => Seq("--load-path", p))
           
           val cmd = Seq("sass", "--stdin", "--no-source-map", "--style=expanded") ++ includePaths
           val result = (cmd #< new java.io.ByteArrayInputStream(content.getBytes("UTF-8"))).!!
@@ -359,11 +368,15 @@ class PasteComboHandler(
   
   /**
    * Resolve module path using naming conventions (fallback when not in manifest).
+   * 
+   * NOTE: paste.ui.* modules are resolved from pasteElementsPath only.
+   * If using paste-elements-webjar, JS modules must be in the local pasteElementsPath.
+   * Webjar support for paste.ui.* can be added if needed in the future.
    */
   private def resolveModulePathByConvention(module: String, ext: String): (String, String) = {
     // Site modules: site.home -> siteAssetsPath/site.js
     // paste.ui.* -> paste-elements/modules/
-    // paste.* -> paste/src/js/
+    // paste.* -> paste/src/js/ (checks webjar first)
     
     module match {
       case "paste" => 
@@ -378,13 +391,61 @@ class PasteComboHandler(
         (pasteElementsPath, s"modules/$component/$component.$ext")
       case m if m.startsWith("paste.") =>
         val sub = m.stripPrefix("paste.")
-        (pastePath, s"$sub.$ext")
+        // Try webjar first, then fallback to pastePath
+        val webjarPath = findInWebjars("paste-webjar", s"src/js/$sub.$ext")
+        webjarPath.getOrElse((pastePath, s"$sub.$ext"))
       case m if m.startsWith("polyfills.") =>
         // polyfills.getcomputedstyle -> paste/src/js/polyfills/getcomputedstyle.js
         val sub = m.stripPrefix("polyfills.")
         (pastePath, s"polyfills/$sub.$ext")
       case _ => 
         (pasteElementsPath, s"$module.$ext")
+    }
+  }
+  
+  /**
+   * Compute SCSS include paths from extracted webjars (called once at construction).
+   */
+  private def computeWebjarScssPaths(): Seq[String] = {
+    val webjarDir = Paths.get(webjarBasePath)
+    if (!Files.exists(webjarDir)) {
+      return Seq.empty
+    }
+    
+    val paths = mutable.ArrayBuffer[String]()
+    
+    Option(webjarDir.toFile.listFiles()).foreach { files =>
+      files.filter(_.isDirectory).foreach { artifactDir =>
+        Option(artifactDir.listFiles()).foreach { versionFiles =>
+          versionFiles.filter(_.isDirectory).foreach { versionDir =>
+            val scssDir = versionDir.toPath.resolve("src/scss")
+            if (Files.exists(scssDir)) {
+              paths += scssDir.toString
+            }
+          }
+        }
+      }
+    }
+    
+    paths.toSeq
+  }
+  
+  /**
+   * Find a file in extracted webjars directory.
+   * Returns Option[(basePath, relativePath)] if found.
+   */
+  private def findInWebjars(artifactId: String, relativePath: String): Option[(String, String)] = {
+    val webjarDir = Paths.get(webjarBasePath, artifactId)
+    if (!Files.exists(webjarDir)) {
+      return None
+    }
+    
+    // Find version directory (one level deep)
+    Option(webjarDir.toFile.listFiles()).flatMap { files =>
+      files.filter(_.isDirectory).collectFirst {
+        case versionDir if Files.exists(versionDir.toPath.resolve(relativePath)) =>
+          (versionDir.getAbsolutePath, relativePath)
+      }
     }
   }
 }
@@ -399,8 +460,12 @@ object PasteComboHandler {
    * Create handler with manifest for module lookup.
    * This is the preferred method - uses @module comments from manifest.
    */
-  def withManifest(manifest: Manifest, outputBasePath: String = "target/public"): PasteComboHandler = 
-    new PasteComboHandler(manifest = Some(manifest), outputBasePath = outputBasePath)
+  def withManifest(
+    manifest: Manifest, 
+    outputBasePath: String = "target/public",
+    webjarBasePath: String = "target/paste-assetgraph-webjars"
+  ): PasteComboHandler = 
+    new PasteComboHandler(manifest = Some(manifest), outputBasePath = outputBasePath, webjarBasePath = webjarBasePath)
   
   /**
    * Create handler with custom paths (fallback convention-based resolution).
@@ -409,10 +474,29 @@ object PasteComboHandler {
     new PasteComboHandler(pastePath, pasteElementsPath)
   
   /**
+   * Create handler with custom paths and webjar base path.
+   */
+  def apply(pastePath: String, pasteElementsPath: String, webjarBasePath: String): PasteComboHandler = 
+    new PasteComboHandler(pastePath, pasteElementsPath, webjarBasePath = webjarBasePath)
+  
+  /**
    * Create handler with all paths including site assets.
    */
   def apply(pastePath: String, pasteElementsPath: String, siteJsPath: String, siteCssPath: String, sitePrefix: String): PasteComboHandler = 
     new PasteComboHandler(pastePath, pasteElementsPath, siteJsPath, siteCssPath, sitePrefix)
+  
+  /**
+   * Create handler with all paths including site assets and webjar base path.
+   */
+  def apply(
+    pastePath: String, 
+    pasteElementsPath: String, 
+    siteJsPath: String, 
+    siteCssPath: String, 
+    sitePrefix: String,
+    webjarBasePath: String
+  ): PasteComboHandler = 
+    new PasteComboHandler(pastePath, pasteElementsPath, siteJsPath, siteCssPath, sitePrefix, webjarBasePath = webjarBasePath)
   
   /**
    * Create handler with manifest and fallback paths.
@@ -421,8 +505,15 @@ object PasteComboHandler {
     new PasteComboHandler(pastePath, pasteElementsPath, manifest = Some(manifest))
   
   /**
-   * Create handler with manifest, fallback paths, and output base path.
+   * Create handler with manifest, fallback paths, output path, and webjar path.
+   * Note: For custom webjarBasePath only, use the 3-arg version with named parameters.
    */
-  def apply(manifest: Manifest, pastePath: String, pasteElementsPath: String, outputBasePath: String): PasteComboHandler = 
-    new PasteComboHandler(pastePath, pasteElementsPath, manifest = Some(manifest), outputBasePath = outputBasePath)
+  def apply(
+    manifest: Manifest, 
+    pastePath: String, 
+    pasteElementsPath: String, 
+    outputBasePath: String,
+    webjarBasePath: String = "target/paste-assetgraph-webjars"
+  ): PasteComboHandler = 
+    new PasteComboHandler(pastePath, pasteElementsPath, manifest = Some(manifest), outputBasePath = outputBasePath, webjarBasePath = webjarBasePath)
 }
