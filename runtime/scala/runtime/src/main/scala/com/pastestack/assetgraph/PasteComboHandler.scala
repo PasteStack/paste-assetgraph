@@ -52,12 +52,17 @@ class PasteComboHandler(
   // Thread-safe: accessed concurrently from Pekko HTTP request handlers
   private val dependencyCache: ConcurrentHashMap[String, (Seq[String], Long)] = new ConcurrentHashMap()
   
+  // Cache for webjar file lookups: (artifactId, relativePath) -> Option[(basePath, relativePath)]
+  // Avoids repeated filesystem traversal on the hot path for every JS module request
+  private val webjarFileCache: ConcurrentHashMap[(String, String), Option[(String, String)]] = new ConcurrentHashMap()
+  
   private val sassWarningShown: AtomicBoolean = new AtomicBoolean(false)
   
   /** Clear all caches. Call when source files change (e.g., from a file watcher). */
   def clearCaches(): Unit = {
     dependencyCache.clear()
     scssCache.clear()
+    webjarFileCache.clear()
   }
   
   /**
@@ -380,7 +385,10 @@ class PasteComboHandler(
     
     module match {
       case "paste" => 
-        (pastePath, s"paste.$ext")
+        // Try webjar first, then fallback to pastePath
+        val webjarRelPath = if (ext == "css") s"src/scss/paste.$ext" else s"src/js/paste.$ext"
+        val webjarPath = findInWebjars("paste-webjar", webjarRelPath)
+        webjarPath.getOrElse((pastePath, s"paste.$ext"))
       case m if m.startsWith(s"$sitePrefix.") =>
         // Site-specific module: site.home -> site.js or site.scss
         val component = m.stripPrefix(s"$sitePrefix.")
@@ -396,8 +404,10 @@ class PasteComboHandler(
         webjarPath.getOrElse((pastePath, s"$sub.$ext"))
       case m if m.startsWith("polyfills.") =>
         // polyfills.getcomputedstyle -> paste/src/js/polyfills/getcomputedstyle.js
+        // Try webjar first, then fallback to pastePath
         val sub = m.stripPrefix("polyfills.")
-        (pastePath, s"polyfills/$sub.$ext")
+        val webjarPath = findInWebjars("paste-webjar", s"src/js/polyfills/$sub.$ext")
+        webjarPath.getOrElse((pastePath, s"polyfills/$sub.$ext"))
       case _ => 
         (pasteElementsPath, s"$module.$ext")
     }
@@ -435,18 +445,26 @@ class PasteComboHandler(
    * Returns Option[(basePath, relativePath)] if found.
    */
   private def findInWebjars(artifactId: String, relativePath: String): Option[(String, String)] = {
-    val webjarDir = Paths.get(webjarBasePath, artifactId)
-    if (!Files.exists(webjarDir)) {
-      return None
-    }
+    val cacheKey = (artifactId, relativePath)
+    val cached = webjarFileCache.get(cacheKey)
+    if (cached != null) return cached
     
-    // Find version directory (one level deep)
-    Option(webjarDir.toFile.listFiles()).flatMap { files =>
-      files.filter(_.isDirectory).collectFirst {
-        case versionDir if Files.exists(versionDir.toPath.resolve(relativePath)) =>
-          (versionDir.getAbsolutePath, relativePath)
+    val result = {
+      val webjarDir = Paths.get(webjarBasePath, artifactId)
+      if (!Files.exists(webjarDir)) None
+      else {
+        // Find version directory (one level deep)
+        Option(webjarDir.toFile.listFiles()).flatMap { files =>
+          files.filter(_.isDirectory).collectFirst {
+            case versionDir if Files.exists(versionDir.toPath.resolve(relativePath)) =>
+              (versionDir.getAbsolutePath, relativePath)
+          }
+        }
       }
     }
+    
+    webjarFileCache.put(cacheKey, result)
+    result
   }
 }
 
