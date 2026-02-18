@@ -210,7 +210,13 @@ case class Manifest(
    * Read file content from classpath resource (for inlining).
    */
   def readResource(resourcePath: String): Option[String] = {
-    val stream = getClass.getResourceAsStream(resourcePath)
+    val cl = Option(Thread.currentThread().getContextClassLoader)
+      .orElse(Option(getClass.getClassLoader))
+      .orNull
+    val stream = if (cl != null)
+      cl.getResourceAsStream(resourcePath.stripPrefix("/"))
+    else
+      getClass.getResourceAsStream(resourcePath)
     if (stream == null) None
     else scala.util.Try {
       val source = scala.io.Source.fromInputStream(stream)
@@ -434,19 +440,24 @@ object Manifest extends DefaultJsonProtocol {
     scala.util.Try(loadFromResource("/paste-assetgraph-manifest.json")).toOption
   }
   
+  private val webjarResourceCache: scala.collection.concurrent.TrieMap[(String, String, String), Option[String]] =
+    scala.collection.concurrent.TrieMap.empty
+
+  private[assetgraph] def clearWebjarCache(): Unit = webjarResourceCache.clear()
+
   /**
    * Discover a webjar classpath resource path without hardcoding the version.
    * Reads the version from META-INF/maven/{groupId}/{artifactId}/pom.properties,
    * then constructs the full webjar resource path.
+   *
+   * Note: the returned path has a leading `/` suitable for `Class.getResourceAsStream`
+   * or `readResource`. Do not strip the `/` before passing to `ClassLoader.getResourceAsStream`.
    *
    * @param artifactId The webjar artifact ID (e.g. "paste-webjar")
    * @param filePath   The file path within the webjar (e.g. "src/js/paste.js")
    * @param groupId    The Maven group ID (defaults to "com.pastestack")
    * @return The full classpath resource path, or None if the webjar is not on the classpath
    */
-  private val webjarResourceCache: scala.collection.concurrent.TrieMap[(String, String, String), Option[String]] =
-    scala.collection.concurrent.TrieMap.empty
-
   def webjarResource(artifactId: String, filePath: String, groupId: String = "com.pastestack"): Option[String] =
     webjarResourceCache.getOrElseUpdate((artifactId, filePath, groupId), {
       val propsPath = s"META-INF/maven/$groupId/$artifactId/pom.properties"
