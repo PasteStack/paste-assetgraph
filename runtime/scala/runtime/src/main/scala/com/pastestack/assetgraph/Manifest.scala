@@ -219,6 +219,27 @@ case class Manifest(
   }
   
   /**
+   * Generate complete JAM bootstrap with paste.js auto-discovered from the webjar on the classpath.
+   * Uses pom.properties to resolve the version, so no hardcoded version is needed in templates.
+   * Falls back with a warning if paste-webjar is not on the runtime classpath.
+   *
+   * @param modules Module names to load via combo URL
+   * @param cdnBase CDN base URL for combo URL
+   * @return Complete HTML with inlined paste.js + module loader
+   */
+  def jamInlineBootstrap(
+    modules: Seq[String],
+    cdnBase: String = ""
+  ): String =
+    Manifest.webjarResource("paste-webjar", "src/js/paste.js") match {
+      case Some(path) => jamInlineBootstrap(path, modules, cdnBase)
+      case None =>
+        System.err.println("[paste-assetgraph] WARNING: paste-webjar not found on classpath via pom.properties. " +
+          "Ensure AssetGraphPlugin.withPaste() is in build.sbt and the webjar is on the runtime classpath.")
+        jamBootstrap(modules, cdnBase, 0)
+    }
+
+  /**
    * Generate complete JAM bootstrap with paste.js inlined.
    * 
    * This reads paste.js from the filesystem/classpath and inlines it,
@@ -230,10 +251,13 @@ case class Manifest(
    * @param cdnBase CDN base URL for combo URL
    * @return Complete HTML with inlined paste.js + module loader
    */
+  def jamInlineBootstrap(pasteJsPath: String, modules: Seq[String]): String =
+    jamInlineBootstrap(pasteJsPath, modules, "")
+
   def jamInlineBootstrap(
     pasteJsPath: String,
     modules: Seq[String],
-    cdnBase: String = ""
+    cdnBase: String
   ): String = {
     // Read paste.js content
     val pasteJsContent = if (pasteJsPath.startsWith("/")) {
@@ -261,7 +285,11 @@ case class Manifest(
 <script type="text/javascript">(function(d,r){$loadingAssignments;r('$url');})(paste.define,paste.require);</script>"""
         
       case None =>
-        // Fallback - just use jamBootstrap without inlined paste.js
+        // paste.js not found at the given path — page will break at runtime.
+        // Log a warning so this is not silent.
+        System.err.println(s"[paste-assetgraph] WARNING: paste.js not found at '$pasteJsPath'. " +
+          "Falling back to jamBootstrap (paste.js will not be loaded — page JS will break). " +
+          "Check that the webjar is on the runtime classpath and the path is correct.")
         jamBootstrap(modules, cdnBase, 0)
     }
   }
@@ -406,6 +434,40 @@ object Manifest extends DefaultJsonProtocol {
     scala.util.Try(loadFromResource("/paste-assetgraph-manifest.json")).toOption
   }
   
+  /**
+   * Discover a webjar classpath resource path without hardcoding the version.
+   * Reads the version from META-INF/maven/{groupId}/{artifactId}/pom.properties,
+   * then constructs the full webjar resource path.
+   *
+   * @param artifactId The webjar artifact ID (e.g. "paste-webjar")
+   * @param filePath   The file path within the webjar (e.g. "src/js/paste.js")
+   * @param groupId    The Maven group ID (defaults to "com.pastestack")
+   * @return The full classpath resource path, or None if the webjar is not on the classpath
+   */
+  private val webjarResourceCache: scala.collection.concurrent.TrieMap[(String, String, String), Option[String]] =
+    scala.collection.concurrent.TrieMap.empty
+
+  def webjarResource(artifactId: String, filePath: String, groupId: String = "com.pastestack"): Option[String] =
+    webjarResourceCache.getOrElseUpdate((artifactId, filePath, groupId), {
+      val propsPath = s"META-INF/maven/$groupId/$artifactId/pom.properties"
+      val cl = Option(Thread.currentThread().getContextClassLoader)
+        .orElse(Option(getClass.getClassLoader))
+        .orNull
+      if (cl == null) None
+      else {
+        val stream = cl.getResourceAsStream(propsPath)
+        if (stream == null) None
+        else scala.util.Try {
+          val props = new java.util.Properties()
+          try { props.load(stream) } finally { stream.close() }
+          val artifactVersion = props.getProperty("version")
+          if (artifactVersion != null && artifactVersion.nonEmpty)
+            Some(s"/META-INF/resources/webjars/$artifactId/$artifactVersion/$filePath")
+          else None
+        }.toOption.flatten
+      }
+    })
+
   /**
    * Empty manifest for fallback.
    */
