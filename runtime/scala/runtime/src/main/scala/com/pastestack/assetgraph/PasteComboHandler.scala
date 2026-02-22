@@ -43,7 +43,7 @@ class PasteComboHandler(
 ) {
   
   // Regex to parse @requires comments: @requires paste/dom -> paste.dom
-  private val RequiresPattern: Regex = """@requires\s+([\w/]+)""".r
+  private val RequiresPattern: Regex = """@requires\s+([\w/-]+)""".r
   
   // Cache webjar SCSS paths at construction time to avoid filesystem traversal on every compile
   private lazy val webjarIncludePaths: Seq[String] = computeWebjarScssPaths()
@@ -394,14 +394,17 @@ class PasteComboHandler(
         val component = m.stripPrefix(s"$sitePrefix.")
         val basePath = if (ext == "css") siteCssPath else siteJsPath
         (basePath, s"$component.$ext")
-      case m if m.startsWith("paste.ui.") =>
-        val component = m.stripPrefix("paste.ui.")
-        (pasteElementsPath, s"modules/$component/$component.$ext")
       case m if m.startsWith("paste.") =>
-        val sub = m.stripPrefix("paste.")
-        // Try webjar first, then fallback to pastePath
-        val webjarPath = findInWebjars("paste-webjar", s"src/js/$sub.$ext")
-        webjarPath.getOrElse((pastePath, s"$sub.$ext"))
+        // Cascade: paste-elements first (by filesystem), then paste core / webjar
+        val component = m.split('.').last
+        val elementsRelPath = s"modules/$component/$component.$ext"
+        if (Files.exists(Paths.get(pasteElementsPath, elementsRelPath))) {
+          (pasteElementsPath, elementsRelPath)
+        } else {
+          val sub = m.stripPrefix("paste.")
+          val webjarPath = findInWebjars("paste-webjar", s"src/js/$sub.$ext")
+          webjarPath.getOrElse((pastePath, s"$sub.$ext"))
+        }
       case m if m.startsWith("polyfills.") =>
         // polyfills.getcomputedstyle -> paste/src/js/polyfills/getcomputedstyle.js
         // Try webjar first, then fallback to pastePath
