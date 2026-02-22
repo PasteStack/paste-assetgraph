@@ -31,6 +31,13 @@ build-rust:
   extends:
     - .tomshley-sbt-rust-runtime
   stage: build
+  variables:
+    # Enable cargo-zigbuild to download macOS SDK automatically
+    CARGO_ZIGBUILD_CACHE_DIR: "${CI_PROJECT_DIR}/.cargo-zigbuild-cache"
+  cache:
+    key: cargo-zigbuild-sdk
+    paths:
+      - .cargo-zigbuild-cache/
   script:
     - echo "=== Cross-compiling Rust binary for all platforms ==="
     - cargo zigbuild --release --target x86_64-unknown-linux-gnu
