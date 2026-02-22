@@ -7,7 +7,7 @@
 # ---------------------------------------------------------------------------
 include:
   - project: 'tomshley/brands/global/tware/tech/products/provisioning/cicd-pipelines'
-    ref: 'v0.4.18'
+    ref: 'v0.4.19'
     file:
       - '/gitlab/ci/.stages-base.yml'
       - '/gitlab/ci/.gitflow-base.yml'
@@ -20,7 +20,7 @@ include:
       - '/gitlab/ci/.security-scanning.yml'
 
 variables:
-  CICD_PIPELINES_RUNNER_TAG: "0.4.18"
+  CICD_PIPELINES_RUNNER_TAG: "0.4.19"
   BASE_CONTAINERS_REGISTRY: registry.gitlab.com/tomshley/brands/global/tware/tech/products/provisioning/base-containers
   BASE_CONTAINERS_UPSTREAM_TAG: "0.4.3"
 
