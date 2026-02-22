@@ -32,13 +32,25 @@ build-rust:
     - .tomshley-sbt-rust-runtime
   stage: build
   variables:
-    # Enable cargo-zigbuild to download macOS SDK automatically
-    CARGO_ZIGBUILD_CACHE_DIR: "${CI_PROJECT_DIR}/.cargo-zigbuild-cache"
+    MACOS_SDK_VERSION: "14.5"
+    SDKROOT: "${CI_PROJECT_DIR}/.macos-sdk/MacOSX${MACOS_SDK_VERSION}.sdk"
   cache:
-    key: cargo-zigbuild-sdk
+    key: macos-sdk-${MACOS_SDK_VERSION}
     paths:
-      - .cargo-zigbuild-cache/
+      - .macos-sdk/
   script:
+    - echo "=== Setting up macOS SDK for cross-compilation ==="
+    - |
+      if [ ! -d "${SDKROOT}" ]; then
+        echo "Downloading macOS SDK ${MACOS_SDK_VERSION}..."
+        mkdir -p .macos-sdk
+        wget -q https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz
+        tar -xf MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz -C .macos-sdk/
+        rm MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz
+        echo "SDK extracted to ${SDKROOT}"
+      else
+        echo "Using cached macOS SDK at ${SDKROOT}"
+      fi
     - echo "=== Cross-compiling Rust binary for all platforms ==="
     - cargo zigbuild --release --target x86_64-unknown-linux-gnu
     - cargo zigbuild --release --target aarch64-apple-darwin
