@@ -7,18 +7,22 @@
 # ---------------------------------------------------------------------------
 include:
   - project: 'tomshley/brands/global/tware/tech/products/provisioning/cicd-pipelines'
-    ref: 'v0.1.1'
+    ref: 'v0.4.18'
     file:
       - '/gitlab/ci/.stages-base.yml'
       - '/gitlab/ci/.gitflow-base.yml'
       - '/gitlab/ci/.gitflow-branch-policy.yml'
+      - '/gitlab/ci/.gitflow-jobs.yml'
       - '/gitlab/ci/.sbt-runtime.yml'
       - '/gitlab/ci/.sbt-rust-runtime.yml'
+      - '/gitlab/ci/.artifact-tags.yml'
       - '/gitlab/ci/.artifact-publish-policy.yml'
       - '/gitlab/ci/.security-scanning.yml'
 
 variables:
-  CICD_PIPELINES_RUNNER_TAG: "0.1.1"
+  CICD_PIPELINES_RUNNER_TAG: "0.4.18"
+  BASE_CONTAINERS_REGISTRY: registry.gitlab.com/tomshley/brands/global/tware/tech/products/provisioning/base-containers
+  BASE_CONTAINERS_UPSTREAM_TAG: "0.4.3"
 
 # ---------------------------------------------------------------------------
 # Build
@@ -28,13 +32,22 @@ build-rust:
     - .tomshley-sbt-rust-runtime
   stage: build
   script:
-    - cargo build --release
+    - echo "=== Cross-compiling Rust binary for all platforms ==="
+    - cargo zigbuild --release --target x86_64-unknown-linux-gnu
+    - cargo zigbuild --release --target aarch64-apple-darwin
+    - cargo zigbuild --release --target x86_64-apple-darwin
     - mkdir -p runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64
-    - cp target/release/paste-assetgraph
+    - mkdir -p runtime/scala/sbt-plugin/src/main/resources/native/darwin-aarch64
+    - mkdir -p runtime/scala/sbt-plugin/src/main/resources/native/darwin-amd64
+    - cp target/x86_64-unknown-linux-gnu/release/paste-assetgraph
         runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64/paste-assetgraph
+    - cp target/aarch64-apple-darwin/release/paste-assetgraph
+        runtime/scala/sbt-plugin/src/main/resources/native/darwin-aarch64/paste-assetgraph
+    - cp target/x86_64-apple-darwin/release/paste-assetgraph
+        runtime/scala/sbt-plugin/src/main/resources/native/darwin-amd64/paste-assetgraph
   artifacts:
     paths:
-      - runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64/paste-assetgraph
+      - runtime/scala/sbt-plugin/src/main/resources/native/
     expire_in: 1 hour
 
 build-sbt:
@@ -81,4 +94,5 @@ maven-publish:
     - cd sbt-plugin
     - ls -la src/main/resources/native/linux-amd64/
     - ls -la src/main/resources/native/darwin-aarch64/
+    - ls -la src/main/resources/native/darwin-amd64/
     - sbt publish

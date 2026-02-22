@@ -52,7 +52,7 @@ impl AssetGraph {
             storage,
             // Compiled once for reuse
             requires_re: Regex::new(r"@requires\s+([\w./]+)").unwrap(),
-            module_re: Regex::new(r"@module\s+([\w./]+)").unwrap(),
+            module_re: Regex::new(r#"@module\s+"?([\w./]+)"?"#).unwrap(),
         }
     }
     
@@ -138,7 +138,36 @@ impl AssetGraph {
                 let css_key = format!("css/{}.css", base_name);
                 seen_asset_keys.insert(css_key);
                 
-                if let Some((module_name, output, version, _asset_key)) = self.process_scss(path, &mut manifest)? {
+                if let Some((module_name, output, version, _asset_key)) = self.process_scss(path, &self.config.source.scss, &mut manifest)? {
+                    css_sorted_deps.push((module_name, output, version));
+                }
+            }
+        }
+        
+        // Process SCSS files from include paths (e.g. paste-elements modules)
+        for include_path in &self.config.include_paths {
+            if !include_path.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(include_path)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "scss"))
+            {
+                let path = entry.path();
+                // Skip partials (files starting with _)
+                if path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.starts_with('_'))
+                {
+                    continue;
+                }
+                let rel_path = path.strip_prefix(include_path)?;
+                let base_name = rel_path.with_extension("").to_string_lossy().to_string();
+                let css_key = format!("css/{}.css", base_name);
+                seen_asset_keys.insert(css_key);
+                
+                if let Some((module_name, output, version, _asset_key)) = self.process_scss(path, include_path, &mut manifest)? {
                     css_sorted_deps.push((module_name, output, version));
                 }
             }
@@ -374,7 +403,7 @@ impl AssetGraph {
     }
     
     /// Process SCSS file and return (module_name, output_path, version, asset_key) for sorted_deps
-    fn process_scss(&self, source_path: &Path, manifest: &mut Manifest) -> Result<Option<(String, String, u32, String)>> {
+    fn process_scss(&self, source_path: &Path, base_dir: &Path, manifest: &mut Manifest) -> Result<Option<(String, String, u32, String)>> {
         let content = fs::read_to_string(source_path)?;
         
         // Extract @module comment if present (same format as JS)
@@ -389,6 +418,7 @@ impl AssetGraph {
             .collect();
         
         // Compile SCSS using grass with include paths
+        // Use from_path so grass knows the file's location for relative @import resolution
         let mut options = grass::Options::default()
             .load_path(&self.config.source.scss);
         
@@ -397,13 +427,13 @@ impl AssetGraph {
             options = options.load_path(include_path);
         }
         
-        let css_content = grass::from_string(content, &options)?;
+        let css_content = grass::from_path(source_path, &options)?;
         
         // Strip comments before hashing (so comments don't trigger new versions)
         let stripped = strip_css_comments(&css_content);
         let hash = format!("{:x}", md5::compute(stripped.as_bytes()));
         
-        let rel_path = source_path.strip_prefix(&self.config.source.scss)?;
+        let rel_path = source_path.strip_prefix(base_dir)?;
         let base_name = rel_path.with_extension("").to_string_lossy().to_string();
         let key = format!("css/{}.css", base_name);
         let output_base = format!("/css/{}", base_name);
@@ -480,6 +510,14 @@ pub async fn watch(config: Config) -> Result<()> {
         watcher.watch(&config.source.scss, RecursiveMode::Recursive)?;
     } else {
         eprintln!("Warning: SCSS source directory does not exist: {:?}", config.source.scss);
+    }
+    
+    // Also watch include paths for SCSS changes (e.g. paste-elements modules)
+    for include_path in &config.include_paths {
+        if include_path.exists() {
+            watcher.watch(include_path, RecursiveMode::Recursive)?;
+            println!("  {:?} (include path)", include_path);
+        }
     }
     
     // Initial build — reuse the same AssetGraph instance across rebuilds
