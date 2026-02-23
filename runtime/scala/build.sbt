@@ -1,8 +1,37 @@
+import scala.io.Source
+
 // Common settings
 val commonSettings = Seq(
   organization := "com.pastestack",
-  version := "0.1.0",
+  version := {
+    val base = "0.1.0"
+    if (sys.env.contains("CI_COMMIT_TAG")) base
+    else s"$base-SNAPSHOT"
+  },
   publishMavenStyle := true,
+  publishTo := Some("gitlab-maven" at
+    s"https://gitlab.com/api/v4/projects/${sys.env.getOrElse("GITLAB_PUBLISH_PROJECT_ID", "70289607")}/packages/maven"),
+  credentials ++= {
+    val projectCredentials = file("../..") / ".secure_files" / ".credentials.gitlab"
+    val homeCredentials = Path.userHome / ".sbt" / "gitlab-token"
+
+    if (projectCredentials.exists()) {
+      Seq(Credentials(projectCredentials))
+    } else if (homeCredentials.exists()) {
+      val src = Source.fromFile(homeCredentials)
+      val token = try src.getLines().mkString.trim finally src.close()
+      Seq(Credentials(
+        "GitLab Packages Registry",
+        "gitlab.com",
+        "Private-Token",
+        token
+      ))
+    } else {
+      sys.env.get("GITLAB_TOKEN").map { token =>
+        Credentials("GitLab Packages Registry", "gitlab.com", "Private-Token", token)
+      }.toSeq
+    }
+  },
   licenses := Seq("MIT" -> url("https://opensource.org/licenses/MIT")),
   homepage := Some(url("https://github.com/PasteStack/paste-assetgraph-scala"))
 )

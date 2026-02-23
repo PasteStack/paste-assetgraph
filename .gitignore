@@ -6,10 +6,22 @@ Cargo.lock
 .idea/
 *.iml
 .vscode/
+.windsurf/
+
+# Secrets
+*.env
+.secure_files/*
+!.secure_files/
+!.secure_files/*.example
+cache.config
+credentials.config
+endpoint.config
+
+# Native binaries (built by CI via cargo-zigbuild, never committed)
+runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64/
+runtime/scala/sbt-plugin/src/main/resources/native/darwin-aarch64/
+runtime/scala/sbt-plugin/src/main/resources/native/darwin-amd64/
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Snyk Security Extension - AI Rules (auto-generated)
-.windsurf/rules/snyk_rules.md

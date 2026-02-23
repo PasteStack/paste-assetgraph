@@ -1,0 +1,118 @@
+# Copyright (c) 2024–2026 Tomshley
+#
+# Licensed under the Apache License, Version 2.0
+
+# ---------------------------------------------------------------------------
+# Shared CI/CD templates from cicd-pipelines
+# ---------------------------------------------------------------------------
+include:
+  - project: 'tomshley/brands/global/tware/tech/products/provisioning/cicd-pipelines'
+    ref: 'v0.4.20'
+    file:
+      - '/gitlab/ci/.stages-base.yml'
+      - '/gitlab/ci/.gitflow-base.yml'
+      - '/gitlab/ci/.gitflow-branch-policy.yml'
+      - '/gitlab/ci/.gitflow-jobs.yml'
+      - '/gitlab/ci/.sbt-runtime.yml'
+      - '/gitlab/ci/.sbt-rust-runtime.yml'
+      - '/gitlab/ci/.artifact-tags.yml'
+      - '/gitlab/ci/.artifact-publish-policy.yml'
+      - '/gitlab/ci/.security-scanning.yml'
+
+variables:
+  CICD_PIPELINES_RUNNER_TAG: "0.4.20"
+  BASE_CONTAINERS_REGISTRY: registry.gitlab.com/tomshley/brands/global/tware/tech/products/provisioning/base-containers
+  BASE_CONTAINERS_UPSTREAM_TAG: "0.4.3"
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+build-rust:
+  extends:
+    - .tomshley-sbt-rust-runtime
+  stage: build
+  variables:
+    MACOS_SDK_VERSION: "14.5"
+    SDKROOT: "${CI_PROJECT_DIR}/.macos-sdk/MacOSX${MACOS_SDK_VERSION}.sdk"
+    RUSTFLAGS: "-C link-arg=-isysroot -C link-arg=${CI_PROJECT_DIR}/.macos-sdk/MacOSX${MACOS_SDK_VERSION}.sdk -C link-arg=-F${CI_PROJECT_DIR}/.macos-sdk/MacOSX${MACOS_SDK_VERSION}.sdk/System/Library/Frameworks"
+  cache:
+    key: macos-sdk-${MACOS_SDK_VERSION}
+    paths:
+      - .macos-sdk/
+  script:
+    - echo "=== Setting up macOS SDK for cross-compilation ==="
+    - |
+      if [ ! -d "${SDKROOT}" ]; then
+        echo "Downloading macOS SDK ${MACOS_SDK_VERSION}..."
+        mkdir -p .macos-sdk
+        wget -q https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz
+        tar -xf MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz -C .macos-sdk/
+        rm MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz
+        echo "SDK extracted to ${SDKROOT}"
+      else
+        echo "Using cached macOS SDK at ${SDKROOT}"
+      fi
+    - echo "=== Cross-compiling Rust binary for all platforms ==="
+    - cargo zigbuild --release --target x86_64-unknown-linux-gnu
+    - cargo zigbuild --release --target aarch64-apple-darwin
+    - cargo zigbuild --release --target x86_64-apple-darwin
+    - mkdir -p runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64
+    - mkdir -p runtime/scala/sbt-plugin/src/main/resources/native/darwin-aarch64
+    - mkdir -p runtime/scala/sbt-plugin/src/main/resources/native/darwin-amd64
+    - cp target/x86_64-unknown-linux-gnu/release/paste-assetgraph
+        runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64/paste-assetgraph
+    - cp target/aarch64-apple-darwin/release/paste-assetgraph
+        runtime/scala/sbt-plugin/src/main/resources/native/darwin-aarch64/paste-assetgraph
+    - cp target/x86_64-apple-darwin/release/paste-assetgraph
+        runtime/scala/sbt-plugin/src/main/resources/native/darwin-amd64/paste-assetgraph
+  artifacts:
+    paths:
+      - runtime/scala/sbt-plugin/src/main/resources/native/
+    expire_in: 1 hour
+
+build-sbt:
+  extends:
+    - .tomshley-sbt-rust-runtime
+  stage: build
+  script:
+    - cd runtime/scala
+    - sbt compile
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+test-rust:
+  extends:
+    - .tomshley-sbt-rust-runtime
+  stage: test
+  needs: ["build-rust"]
+  script:
+    - cargo test
+
+test-sbt:
+  extends:
+    - .tomshley-sbt-rust-runtime
+  stage: test
+  needs: ["build-sbt"]
+  script:
+    - cd runtime/scala
+    - sbt test
+
+# ---------------------------------------------------------------------------
+# Maven Publish (sbt plugin to GitLab Package Registry)
+# ---------------------------------------------------------------------------
+maven-publish:
+  extends:
+    - .tomshley-sbt-rust-runtime
+    - .flow-artifact-publish
+  needs: ["build-rust", "test-rust", "test-sbt"]
+  script:
+    - echo "=== Publishing runtime + pekko libraries ==="
+    - cd runtime/scala
+    - sbt "+runtime/publish" "+pekko/publish"
+    - echo "=== Publishing sbt-plugin ==="
+    - cd sbt-plugin
+    - ls -la src/main/resources/native/linux-amd64/
+    - ls -la src/main/resources/native/darwin-aarch64/
+    - ls -la src/main/resources/native/darwin-amd64/
+    - sbt publish
