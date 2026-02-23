@@ -21,6 +21,10 @@ pub enum BuildMode {
     React,
 }
 
+/// Shared character class for module names in @requires and @module comments.
+/// Supports word chars, dots, slashes, and hyphens (e.g. paste/utils/animation-frame).
+const MODULE_NAME_RE: &str = r"[\w./-]+";
+
 pub struct AssetGraph {
     config: Config,
     mode: BuildMode,
@@ -50,9 +54,9 @@ impl AssetGraph {
             js_deps: HashMap::new(),
             module_map: HashMap::new(),
             storage,
-            // Compiled once for reuse
-            requires_re: Regex::new(r"@requires\s+([\w./]+)").unwrap(),
-            module_re: Regex::new(r"@module\s+([\w./]+)").unwrap(),
+            // Compiled once for reuse — pattern shared via MODULE_NAME_RE
+            requires_re: Regex::new(&format!(r"@requires\s+({})", MODULE_NAME_RE)).unwrap(),
+            module_re: Regex::new(&format!(r#"@module\s+"?({})"?"#, MODULE_NAME_RE)).unwrap(),
         }
     }
     
@@ -115,11 +119,21 @@ impl AssetGraph {
         // Store JS sorted_deps in manifest
         manifest.sorted_deps.insert("js".to_string(), js_sorted_deps);
         
-        // Process SCSS files
+        // Process SCSS files — cascade source dir then include paths
         let mut css_sorted_deps: Vec<(String, String, u32)> = Vec::new();
         
+        let mut scss_dirs: Vec<&Path> = Vec::new();
         if self.config.source.scss.exists() {
-            for entry in WalkDir::new(&self.config.source.scss)
+            scss_dirs.push(&self.config.source.scss);
+        }
+        for p in &self.config.include_paths {
+            if p.exists() {
+                scss_dirs.push(p);
+            }
+        }
+        
+        for base_dir in &scss_dirs {
+            for entry in WalkDir::new(base_dir)
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().map_or(false, |ext| ext == "scss"))
@@ -133,12 +147,12 @@ impl AssetGraph {
                     continue;
                 }
                 // Track every SCSS asset key to prevent pruning, even without @module
-                let rel_path = path.strip_prefix(&self.config.source.scss)?;
+                let rel_path = path.strip_prefix(base_dir)?;
                 let base_name = rel_path.with_extension("").to_string_lossy().to_string();
                 let css_key = format!("css/{}.css", base_name);
                 seen_asset_keys.insert(css_key);
                 
-                if let Some((module_name, output, version, _asset_key)) = self.process_scss(path, &mut manifest)? {
+                if let Some((module_name, output, version, _asset_key)) = self.process_scss(path, base_dir, &mut manifest)? {
                     css_sorted_deps.push((module_name, output, version));
                 }
             }
@@ -374,7 +388,7 @@ impl AssetGraph {
     }
     
     /// Process SCSS file and return (module_name, output_path, version, asset_key) for sorted_deps
-    fn process_scss(&self, source_path: &Path, manifest: &mut Manifest) -> Result<Option<(String, String, u32, String)>> {
+    fn process_scss(&self, source_path: &Path, base_dir: &Path, manifest: &mut Manifest) -> Result<Option<(String, String, u32, String)>> {
         let content = fs::read_to_string(source_path)?;
         
         // Extract @module comment if present (same format as JS)
@@ -389,6 +403,7 @@ impl AssetGraph {
             .collect();
         
         // Compile SCSS using grass with include paths
+        // Use from_path so grass knows the file's location for relative @import resolution
         let mut options = grass::Options::default()
             .load_path(&self.config.source.scss);
         
@@ -397,13 +412,13 @@ impl AssetGraph {
             options = options.load_path(include_path);
         }
         
-        let css_content = grass::from_string(content, &options)?;
+        let css_content = grass::from_path(source_path, &options)?;
         
         // Strip comments before hashing (so comments don't trigger new versions)
         let stripped = strip_css_comments(&css_content);
         let hash = format!("{:x}", md5::compute(stripped.as_bytes()));
         
-        let rel_path = source_path.strip_prefix(&self.config.source.scss)?;
+        let rel_path = source_path.strip_prefix(base_dir)?;
         let base_name = rel_path.with_extension("").to_string_lossy().to_string();
         let key = format!("css/{}.css", base_name);
         let output_base = format!("/css/{}", base_name);
@@ -480,6 +495,14 @@ pub async fn watch(config: Config) -> Result<()> {
         watcher.watch(&config.source.scss, RecursiveMode::Recursive)?;
     } else {
         eprintln!("Warning: SCSS source directory does not exist: {:?}", config.source.scss);
+    }
+    
+    // Also watch include paths for SCSS changes (e.g. paste-elements modules)
+    for include_path in &config.include_paths {
+        if include_path.exists() {
+            watcher.watch(include_path, RecursiveMode::Recursive)?;
+            println!("  {:?} (include path)", include_path);
+        }
     }
     
     // Initial build — reuse the same AssetGraph instance across rebuilds
