@@ -440,7 +440,7 @@ object Manifest extends DefaultJsonProtocol {
     scala.util.Try(loadFromResource("/paste-assetgraph-manifest.json")).toOption
   }
   
-  private val webjarResourceCache: scala.collection.concurrent.TrieMap[(String, String, String), Option[String]] =
+  private val webjarResourceCache: scala.collection.concurrent.TrieMap[(String, String, String, Int), Option[String]] =
     scala.collection.concurrent.TrieMap.empty
 
   private[assetgraph] def clearWebjarCache(): Unit = webjarResourceCache.clear()
@@ -453,31 +453,34 @@ object Manifest extends DefaultJsonProtocol {
    * Note: the returned path has a leading `/` suitable for `Class.getResourceAsStream`
    * or `readResource`. Do not strip the `/` before passing to `ClassLoader.getResourceAsStream`.
    *
+   * The cache key includes the classloader identity hash so that sbt reload
+   * (which creates a new classloader with updated webjars) does not serve stale paths.
+   *
    * @param artifactId The webjar artifact ID (e.g. "paste-webjar")
    * @param filePath   The file path within the webjar (e.g. "src/js/paste.js")
    * @param groupId    The Maven group ID (defaults to "com.pastestack")
    * @return The full classpath resource path, or None if the webjar is not on the classpath
    */
-  def webjarResource(artifactId: String, filePath: String, groupId: String = "com.pastestack"): Option[String] =
-    webjarResourceCache.getOrElseUpdate((artifactId, filePath, groupId), {
+  def webjarResource(artifactId: String, filePath: String, groupId: String = "com.pastestack"): Option[String] = {
+    val cl = Option(Thread.currentThread().getContextClassLoader)
+      .orElse(Option(getClass.getClassLoader))
+      .orNull
+    if (cl == null) return None
+    val clId = System.identityHashCode(cl)
+    webjarResourceCache.getOrElseUpdate((artifactId, filePath, groupId, clId), {
       val propsPath = s"META-INF/maven/$groupId/$artifactId/pom.properties"
-      val cl = Option(Thread.currentThread().getContextClassLoader)
-        .orElse(Option(getClass.getClassLoader))
-        .orNull
-      if (cl == null) None
-      else {
-        val stream = cl.getResourceAsStream(propsPath)
-        if (stream == null) None
-        else scala.util.Try {
-          val props = new java.util.Properties()
-          try { props.load(stream) } finally { stream.close() }
-          val artifactVersion = props.getProperty("version")
-          if (artifactVersion != null && artifactVersion.nonEmpty)
-            Some(s"/META-INF/resources/webjars/$artifactId/$artifactVersion/$filePath")
-          else None
-        }.toOption.flatten
-      }
+      val stream = cl.getResourceAsStream(propsPath)
+      if (stream == null) None
+      else scala.util.Try {
+        val props = new java.util.Properties()
+        try { props.load(stream) } finally { stream.close() }
+        val artifactVersion = props.getProperty("version")
+        if (artifactVersion != null && artifactVersion.nonEmpty)
+          Some(s"/META-INF/resources/webjars/$artifactId/$artifactVersion/$filePath")
+        else None
+      }.toOption.flatten
     })
+  }
 
   /**
    * Empty manifest for fallback.

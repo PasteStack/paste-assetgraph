@@ -18,11 +18,13 @@ val commonSettings = Seq(
     if (projectCredentials.exists()) {
       Seq(Credentials(projectCredentials))
     } else if (homeCredentials.exists()) {
+      val src = Source.fromFile(homeCredentials)
+      val token = try src.getLines().mkString.trim finally src.close()
       Seq(Credentials(
         "GitLab Packages Registry",
         "gitlab.com",
         "Private-Token",
-        Source.fromFile(homeCredentials).getLines().mkString.trim
+        token
       ))
     } else {
       sys.env.get("GITLAB_TOKEN").map { token =>
