@@ -1,45 +1,32 @@
-import scala.io.Source
+import com.tomshley.magicroot.sbt.projectsettings.{PublishGitLabPlugin, TomshleyCIBuildVersionPlugin, VersionFilePlugin}
 
 organization := "com.pastestack"
 name := "paste-assetgraph-sbt"
 scalaVersion := "2.12.18"
 publishMavenStyle := true
-licenses := Seq("MIT" -> url("https://opensource.org/licenses/MIT"))
-homepage := Some(url("https://github.com/PasteStack/paste-assetgraph-scala"))
+licenses := Seq("Apache-2.0" -> url("https://www.apache.org/licenses/LICENSE-2.0"))
+homepage := Some(url("https://github.com/PasteStack/paste-assetgraph"))
 
 ThisBuild / versionScheme := Some("semver-spec")
-version := {
-  val base = "0.1.0"
-  if (sys.env.contains("CI_COMMIT_TAG")) base
-  else s"$base-SNAPSHOT"
-}
 
-enablePlugins(SbtPlugin)
+// The version comes from the repository VERSION file, plus the branch revision
+// CI supplies — the same contract as the runtime libraries in ../build.sbt.
+enablePlugins(SbtPlugin, VersionFilePlugin, TomshleyCIBuildVersionPlugin, PublishGitLabPlugin)
+magicRootPublishGitLabProjectId := sys.env.get("TOMSHLEY_CICD_PUBLISH_PROJECT_ID").map(_.toInt).getOrElse(70289607)
+
+// Compatibility floor for consuming builds: compile the plugin against the
+// oldest sbt 1.x it supports rather than whatever this build happens to run.
 pluginCrossBuild / sbtVersion := "1.9.0"
 
-// --- GitLab Maven Registry → paste-registry (project 70289607) ---
-publishTo := Some("gitlab-maven" at
-  s"https://gitlab.com/api/v4/projects/${sys.env.getOrElse("GITLAB_PUBLISH_PROJECT_ID", "70289607")}/packages/maven")
+libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.19" % Test
 
-credentials ++= {
-  // .secure_files/ lives at the repo root, 3 levels up from runtime/scala/sbt-plugin/
-  val projectCredentials = file("../../..") / ".secure_files" / ".credentials.gitlab"
-  val homeCredentials = Path.userHome / ".sbt" / "gitlab-token"
+// The plugin reads this at runtime to keep each version's extracted binary in
+// its own directory, so a new plugin release cannot reuse an older binary.
+Compile / resourceGenerators += Def.task {
+  val output = (Compile / resourceManaged).value / "assetgraph-version.txt"
+  IO.write(output, version.value)
+  Seq(output)
+}.taskValue
 
-  if (projectCredentials.exists()) {
-    Seq(Credentials(projectCredentials))
-  } else if (homeCredentials.exists()) {
-    val src = Source.fromFile(homeCredentials)
-    val token = try src.getLines().mkString.trim finally src.close()
-    Seq(Credentials(
-      "GitLab Packages Registry",
-      "gitlab.com",
-      "Private-Token",
-      token
-    ))
-  } else {
-    sys.env.get("GITLAB_TOKEN").map { token =>
-      Credentials("GitLab Packages Registry", "gitlab.com", "Private-Token", token)
-    }.toSeq
-  }
-}
+// CI supplies this project with the native binaries and native/manifest.json
+// produced by the Rust build job before the plugin is packaged.

@@ -2,12 +2,16 @@
 
 ## Overview
 
-`paste-assetgraph` is a Rust-based asset pipeline for PasteStack that handles:
+`paste-assetgraph` is the primary PasteStack toolchain: one Rust static binary that handles:
 - SCSS compilation with include paths
-- JavaScript bundling and dependency resolution
+- JavaScript bundling, dependency resolution, and safe AST printing
 - Asset versioning with content hashing
 - Manifest generation for runtime asset resolution
 - JAM (JavaScript Asset Manager) combo URL support
+- Static-site `dist` rollups for hosts with no combo handler
+
+The sbt plugin is a thin JVM build wrapper around this CLI. Other consumers invoke the CLI directly;
+the binary is not a server runtime dependency.
 
 ## Storage Backends
 
@@ -37,11 +41,34 @@ storage.keep-versions = 10
 output.base = "dist"
 ```
 
-- Writes versioned assets to `dist/` directory
-- Preserves old versions for rolling deploys
-- Assets should be committed to source control
+- Writes versioned per-module assets to `dist/js/` and `dist/css/`
+- Emits `dist/js/assetgraph.js` and `dist/css/assetgraph.css` rollups
+- Static HTML references those rollups, so no combo handler or server-side manifest lookup is needed
+- Preserves old per-module versions for rolling deploys
 - Prunes old versions beyond `keep-versions` limit
-- **Rollback support:** Yes (old versions remain accessible)
+- **Rollback support:** Yes (old per-module URLs remain accessible)
+
+#### Rollup composition
+
+Each rollup concatenates every asset of its type in dependency order: a module's
+dependencies are emitted before the module itself, and assets with no declared
+module name (a stylesheet without `@module`) follow in key order. JavaScript
+parts are joined by a newline, an empty statement, and a newline, so a file
+ending in an expression cannot continue into the next file's leading
+parenthesis. Stylesheets are joined by a newline.
+
+#### Reproducible output
+
+A `dist` build is meant to be committed and diffed, so identical sources must
+produce identical bytes on every machine:
+
+- Module and file ordering is sorted, never dependent on map iteration or
+  directory order
+- Manifest JSON is written with recursively sorted object keys
+- Build timestamps are dropped and the manifest version becomes `static`;
+  content hashes remain the asset identity
+- Each asset's `source` is recorded relative to the project root, with forward
+  slashes, so it names the file rather than the machine that built it
 
 ### S3 Backend (Future)
 
@@ -72,10 +99,26 @@ storage.keep-versions = 10
 Assets are versioned using content hashing:
 
 1. **Hash calculation:** Content is stripped of comments, then MD5 hashed
+   together with the identity of the pipeline that prints the output
 2. **Version increment:** Version number increases only when hash changes
 3. **Output format:** `{name}.{hash}.v{version}.min.{ext}`
 
 Example: `app.abc123def456.v3.min.js`
+
+An output file whose name already exists is never rewritten, so the hash has to
+cover the transformation as well as the source. It therefore includes a
+transform signature (the JS and CSS printers and their options) and whether the
+build emits printed or verbatim output. Switching `minify` off, or changing the
+printer, produces new filenames instead of silently reusing the previous bytes.
+
+### Module Names and Asset Keys
+
+An asset's key in the manifest is `{type}/{path}.{type}` — for JavaScript,
+derived from the declared module name. The `modules` map points a declared name
+at that key, never at a source path, because every consumer resolves a module by
+looking the value up in `assets`. A name declared for both a script and a
+stylesheet keeps the entry that the key convention cannot reconstruct; the other
+resolves through the convention key.
 
 ### Comment Stripping
 
@@ -105,7 +148,10 @@ JAM (JavaScript Asset Manager) serves multiple modules concatenated:
 
 - Timestamp changes when any module in the combo changes
 - Enables aggressive caching while ensuring freshness
-- Server concatenates requested modules on-the-fly
+- Server concatenates requested modules on-the-fly, separating JavaScript
+  modules with a terminating empty statement
+- A `.min.` request serves compiled output; a request without it serves the
+  module sources, so an edited file is visible without a rebuild
 
 ## Configuration
 
@@ -158,5 +204,4 @@ manifest = "dist/manifest.json"
 - [ ] S3 storage backend implementation
 - [ ] CloudFront invalidation integration
 - [ ] Source map generation
-- [ ] CSS/JS minification (lightningcss, swc)
 - [ ] Image optimization pipeline

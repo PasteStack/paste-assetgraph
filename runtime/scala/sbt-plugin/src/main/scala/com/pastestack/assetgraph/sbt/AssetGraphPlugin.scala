@@ -128,30 +128,38 @@ object AssetGraphPlugin extends AutoPlugin {
       val base = baseDirectory.value
       val configFile = base / "target" / "paste-assetgraph-generated.conf"
       
+      // Task and setting values are resolved before the branch below: a regular
+      // task evaluates every dependency it names regardless of any `if`, so
+      // reading them here is what actually happens.
+      val resourceManagedDir = (Compile / resourceManaged).value
+      val configuredManifestPath = pasteAssetGraphManifestPath.value
+      val webjarPaths = pasteAssetGraphWebJarPaths.value
+      val allIncludes = pasteAssetGraphIncludePaths.value ++ webjarPaths
+      val sourceDirs = pasteAssetGraphSourceDirs.value
+      val outputDir = pasteAssetGraphOutputDir.value
+      val minify = pasteAssetGraphMinify.value
+      val sourceMaps = pasteAssetGraphSourceMaps.value
+      val debug = pasteAssetGraphDebug.value
+
       // Ensure config exists before watching (generate if missing)
       if (!configFile.exists()) {
         log.info("Generating config file before watch...")
-        val resourceManagedDir = (Compile / resourceManaged).value
-        val manifestPath = if (pasteAssetGraphManifestPath.value.nonEmpty) {
-          pasteAssetGraphManifestPath.value
+        val manifestPath = if (configuredManifestPath.nonEmpty) {
+          configuredManifestPath
         } else {
           (resourceManagedDir / "paste-assetgraph-manifest.json").relativeTo(base).map(_.getPath).getOrElse(
             resourceManagedDir.getPath + "/paste-assetgraph-manifest.json"
           )
         }
         
-        // Merge manual include paths with auto-discovered webjar paths
-        val webjarPaths = pasteAssetGraphWebJarPaths.value
-        val allIncludes = pasteAssetGraphIncludePaths.value ++ webjarPaths
-        
         val config = generateConfig(
-          pasteAssetGraphSourceDirs.value,
-          pasteAssetGraphOutputDir.value,
+          sourceDirs,
+          outputDir,
           manifestPath,
           allIncludes,
-          pasteAssetGraphMinify.value,
-          pasteAssetGraphSourceMaps.value,
-          pasteAssetGraphDebug.value
+          minify,
+          sourceMaps,
+          debug
         )
         IO.createDirectory(configFile.getParentFile)
         IO.write(configFile, config)

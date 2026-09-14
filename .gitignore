@@ -1,6 +1,7 @@
 # Rust
+# Cargo.lock is committed: this crate ships a binary, and CI builds and tests it
+# with --locked so the published binary is built from reviewed dependencies.
 target/
-Cargo.lock
 
 # IDE
 .idea/
@@ -17,10 +18,13 @@ cache.config
 credentials.config
 endpoint.config
 
-# Native binaries (built by CI via cargo-zigbuild, never committed)
-runtime/scala/sbt-plugin/src/main/resources/native/linux-amd64/
-runtime/scala/sbt-plugin/src/main/resources/native/darwin-aarch64/
-runtime/scala/sbt-plugin/src/main/resources/native/darwin-amd64/
+# Native binaries and their checksum manifest (built by CI via cargo-zigbuild
+# for every configured target, never committed). The plugin's test fixtures
+# under src/test/resources/native/ are committed and unaffected.
+runtime/scala/sbt-plugin/src/main/resources/native/
+
+# Output of the determinism fixture build
+features/dist/
 
 # OS
 .DS_Store

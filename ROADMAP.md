@@ -27,11 +27,6 @@ When an SCSS file has no `@module` comment, `process_scss` returns `None`, so th
 ### `jamInlineBootstrap` packagesUrl timestamp (Manifest.scala)
 `packagesUrl` uses `manifest.version` (global build ID) while the combo URL uses per-group max timestamp. This is intentional — packagesUrl is a generic base for dynamic module loading where any module could be requested. The two timestamp strategies serve different cache invalidation purposes. Document this design decision.
 
-### Minify config toggle doesn't invalidate existing output (graph.rs)
-The hash in versioned filenames is derived from comment-stripped source content, not from the output. If a user toggles `minify` from `false` to `true` (or vice versa), the hash and filename don't change, but the existing file on disk has the wrong content (unminified vs minified). The build silently skips rewriting. Same issue for CSS.
-
-**Approach:** Either include `config.minify` / `config.debug_mode` in the hash computation, or always rewrite when the version bumps. A pragmatic fix: only skip writes on subsequent rebuilds with the same version and config.
-
 ### Cross-type module resolution inflates CSS cache timestamps (manifest.rs / Manifest.scala)
 `jam_url` / `jamUrlForType` intentionally uses unfiltered cross-type module lookup for version/timestamp retrieval — this ensures cache busting covers all requested modules. However, it means a CSS combo URL's group timestamp can change when only JS files change (e.g., `paste.ui.heroscroll` maps to JS, its JS timestamp gets picked up for the CSS URL). This causes unnecessary CSS cache invalidation for modules that only have JS assets.
 
@@ -58,11 +53,6 @@ The manifest stores output paths with a hardcoded `/{type}/` prefix (e.g., `/js/
 `self.config.source.js.clone()` and `self.config.include_paths.clone()` are cloned to work around the borrow checker (can't borrow `self` immutably and mutably at the same time). These clones happen on every build/rebuild in watch mode.
 
 **Approach:** Extract paths into local variables before the mutable borrow begins.
-
-### Watch mode doesn't watch `include_paths` (graph.rs)
-The `include_paths` directories (e.g., `../paste-elements`) are scanned during `scan_js_files` and used as SCSS load paths, but the file watcher never registers them. Changes to files in `include_paths` won't trigger rebuilds in watch mode.
-
-**Approach:** Register `include_paths` with the watcher in `watch_and_rebuild`.
 
 ### Include path module name fallback (graph.rs)
 When `scan_js_dir` processes files from `include_paths` that lack `@module` comments, the module name is derived relative to the include path root. For example, `../paste-elements/modules/heroscroll/heroscroll.js` becomes `modules.heroscroll.heroscroll` instead of `paste.ui.heroscroll`. Files in include paths should always have `@module` comments; the silent fallback to path-derived names is a footgun.
@@ -114,16 +104,6 @@ The final `result.split_whitespace().join(" ")` collapses all whitespace includi
 
 **Approach:** Either remove the normalization entirely, or only normalize whitespace outside of string contexts by tracking quote state during the normalization pass.
 
-### `jamBootstrap` inline reads `entry.source` paths which may not exist at runtime (Manifest.scala)
-`jamBootstrap` attempts to read `entry.source` (build-time absolute paths) to calculate total size for inline decisions. In production these paths don't exist, so `readFile` returns `None`, `totalSize` is 0, and inlining is skipped. Degrades gracefully but the code is misleading. Additionally, for inline mode the code should read compiled output, not source.
-
-**Approach:** Use `entry.output` resolved against the output/CDN directory instead of `entry.source`.
-
-### `PasteComboHandler.getDependencies` skips modules map lookup (PasteComboHandler.scala)
-`getDependencies` constructs the asset key directly (`$ext/$module.$ext`) without first checking the `modules` map via `resolveModule`. Both `Manifest.getDependencies` and `expandDependencies` use `resolveModule` first. Modules whose key doesn't follow the convention pattern won't have dependencies resolved.
-
-**Approach:** Use `manifest.flatMap(_.resolveModule(module))` before falling back to direct key construction.
-
 ### sass CLI paths from environment variables should be documented as trusted (PasteComboHandler.scala)
 The `compileScssToCss` method passes `pasteElementsPath` and `siteCssPath` to the `sass` CLI as `--load-path` arguments. These paths originate from constructor parameters which may come from environment variables. While `Seq(...)` avoids shell interpolation, the trust boundary should be documented.
 
@@ -134,17 +114,7 @@ If `resourceManagedDir` is not under `baseDirectory` (unusual but possible with 
 
 **Approach:** Always resolve relative to `baseDirectory` and warn if the path cannot be made relative.
 
-### `Binary.findInPath` uses `which` — not available on Windows (Binary.scala)
-`findInPath` shells out to `which` which doesn't exist on Windows (the equivalent is `where`). The `Try` swallows the failure gracefully so this isn't a crash, but PATH-installed binaries won't be found on Windows.
-
-**Approach:** Check `osName()` and use `where` on Windows, `which` on Unix.
-
 ### Binary.extractBundled race condition (Binary.scala)
 If two parallel sbt builds check `Files.isExecutable(target)` simultaneously, both may attempt extraction. The atomic rename via temp file + `REPLACE_EXISTING` mitigates most risk, but there's a brief window where the target could be replaced while another process executes it.
 
 **Approach:** Use a lock file (`target.lock`) with `FileLock` to serialize extraction across concurrent sbt processes.
-
-### Binary.extractBundled temp file leak on failure (Binary.scala)
-If `Files.move` fails (e.g., permissions issue), the `.tmp` file created by `Files.createTempFile` is never cleaned up. The `Try { ... }.toOption` swallows the error silently. Over multiple failed attempts, temp files accumulate.
-
-**Approach:** Add a `finally` block to clean up the temp file if `Files.move` fails.

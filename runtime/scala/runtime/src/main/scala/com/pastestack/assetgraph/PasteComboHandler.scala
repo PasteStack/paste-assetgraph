@@ -131,13 +131,21 @@ class PasteComboHandler(
     val expandedModules = expandDependencies(modules, ext)
     
     var foundCount = 0
-    val content = expandedModules.map { module =>
+    val parts = expandedModules.map { module =>
       val result = loadModuleResult(module, ext, minified)
       if (result.found) {
         foundCount += 1
       }
       result.content
-    }.mkString("\n")
+    }
+    // JS modules are concatenated into one response. Minified outputs may omit
+    // a trailing ';', so a bare '\n' between modules lets one module's trailing
+    // expression merge with the next (e.g. `))` followed by `(...)` becomes a
+    // call), causing runtime errors such as "e is not a constructor". Separate
+    // JS modules with a newline + ';' + newline to force statement termination
+    // even when the preceding chunk ends in a comment. CSS is unaffected.
+    val separator = if (ext == "js") Manifest.JsConcatSeparator else "\n"
+    val content = parts.mkString(separator)
     (content, foundCount)
   }
   
@@ -168,17 +176,24 @@ class PasteComboHandler(
    * Get dependencies for a module by parsing @requires comments from the source file.
    */
   private def getDependencies(module: String, ext: String): Seq[String] = {
-    // Check manifest first for pre-computed dependencies (works for all asset types)
-    manifest.foreach { m =>
-      val key = s"$ext/${module.replace('.', '/')}.$ext"
-      m.assets.get(key).foreach { entry =>
-        if (entry.dependencies.nonEmpty) return entry.dependencies
-      }
+    // The manifest carries dependencies the build already expanded, for every
+    // asset type. Resolution goes through assetFor so a module whose asset key
+    // does not follow the convention — a stylesheet with a declared @module
+    // name — still contributes its dependencies.
+    val declared = manifest
+      .flatMap(_.assetFor(module, ext))
+      .map(_.dependencies)
+      .filter(_.nonEmpty)
+    
+    // Without a manifest entry, only JS sources describe their dependencies,
+    // through @requires comments parsed at request time.
+    declared.getOrElse {
+      if (ext != "js") Seq.empty else parsedDependencies(module, ext)
     }
-    
-    // Only JS source files have @requires for runtime parsing
-    if (ext != "js") return Seq.empty
-    
+  }
+
+  /** Dependencies parsed from a JS module's source, cached by last-modified time. */
+  private def parsedDependencies(module: String, ext: String): Seq[String] = {
     val path = resolveModulePath(module, ext)
     val lastMod = Try(Files.getLastModifiedTime(path).toMillis).getOrElse(0L)
     
@@ -186,7 +201,7 @@ class PasteComboHandler(
       case Some((deps, cachedMod)) if cachedMod == lastMod => deps
       case _ =>
         val deps = Try {
-          val content = new String(Files.readAllBytes(path))
+          val content = new String(Files.readAllBytes(path), java.nio.charset.StandardCharsets.UTF_8)
           parseDependencies(content)
         }.getOrElse(Seq.empty)
         dependencyCache.put(module, (deps, lastMod))
@@ -226,10 +241,18 @@ class PasteComboHandler(
   }
   
   private def loadModuleResult(module: String, ext: String, minified: Boolean = false): ModuleResult = {
-    // 1. Try pre-compiled output from manifest (preferred for CSS)
-    resolveCompiledOutput(module, ext) match {
-      case Some(compiled) => return ModuleResult(compiled, found = true)
-      case None => // fall through to source resolution
+    // 1. Try pre-compiled output from manifest.
+    //    JS has readable sources, so a non-minified request prefers them:
+    //    that is what makes /paste/{ts}/{module}.js reflect an edited file.
+    //    Where no source can be found (a process running outside the project),
+    //    resolveModulePath still falls back to the compiled artifact rather
+    //    than serving nothing. CSS has no such choice — its source is SCSS —
+    //    so compiled output is used for both.
+    if (ext != "js" || minified) {
+      resolveCompiledOutput(module, ext) match {
+        case Some(compiled) => return ModuleResult(compiled, found = true)
+        case None => // fall through to source resolution
+      }
     }
     
     val path = resolveModulePath(module, ext)
@@ -265,37 +288,31 @@ class PasteComboHandler(
   }
   
   /**
-   * Try to find pre-compiled output for a CSS module via manifest.
+   * Try to find pre-compiled, versioned output for a module via the manifest.
+   *
+   * Applies to both CSS and JS: the manifest's asset outputs are content-hashed
+   * (e.g. /js/paste/ui/heroscroll.<hash>.v1.min.js), so the convention-based
+   * source resolution in resolveModulePath cannot locate them. Serving directly
+   * from the manifest output is the only reliable path for compiled JS modules.
    */
   private def resolveCompiledOutput(module: String, ext: String): Option[String] = {
-    if (ext != "css") return None
+    if (ext != "css" && ext != "js") return None
     
     manifest.flatMap { m =>
-      // module name → asset key via modules map
-      // Only use if the resolved key matches the requested extension;
-      // e.g., paste.ui.heroscroll resolves to js/paste/ui/heroscroll.js
-      // which is wrong when we want CSS.
-      val assetKey = m.resolveModule(module)
-        .filter(_.endsWith(s".$ext"))
-        .orElse {
-          // Fallback: try constructing the key directly
-          val key = s"$ext/${module.replace('.', '/')}.$ext"
-          if (m.assets.contains(key)) Some(key) else None
-        }
-      
-      assetKey.flatMap { key =>
-        // asset key → AssetEntry
-        m.assets.get(key).flatMap { entry =>
-          // Read compiled file from output directory
-          val outputFile = Paths.get(outputBasePath, entry.output.stripPrefix("/"))
-          Try {
-            if (Files.exists(outputFile)) {
-              Some(new String(Files.readAllBytes(outputFile)))
-            } else {
-              None
-            }
-          }.getOrElse(None)
-        }
+      // assetFor resolves the declared module name to an asset of THIS type
+      // only, so paste.ui.heroscroll (declared for JS) cannot answer a CSS
+      // request, and a modules entry that names no existing asset cannot
+      // shadow the conventional key of a different module.
+      m.assetFor(module, ext).flatMap { entry =>
+        // Read compiled file from output directory
+        val outputFile = Paths.get(outputBasePath, entry.output.stripPrefix("/"))
+        Try {
+          if (Files.exists(outputFile)) {
+            Some(new String(Files.readAllBytes(outputFile), java.nio.charset.StandardCharsets.UTF_8))
+          } else {
+            None
+          }
+        }.getOrElse(None)
       }
     }
   }
@@ -337,37 +354,27 @@ class PasteComboHandler(
   }
   
   /**
-   * Resolve module path using manifest or convention.
+   * Resolve a module's file path, preferring what the manifest records.
+   *
+   * The manifest's asset entry carries the module's source path, recorded
+   * relative to the project root, and its compiled output path. Both are used
+   * when they exist on disk — the source first, since this method answers
+   * requests for readable content — and the naming convention answers everything
+   * the manifest does not describe (an unknown module, or a process whose
+   * working directory is not the project root).
    */
   private def resolveModulePath(module: String, ext: String): Path = {
-    // 1. Try manifest lookup first (preferred)
-    // Only use manifest path if it matches the requested extension;
-    // modules like paste.ui.heroscroll map to JS but also have CSS via convention.
-    val manifestPath = manifest.flatMap(_.resolveModule(module))
-      .filter(_.endsWith(s".$ext"))
+    val fromManifest = manifest.flatMap(_.assetFor(module, ext)).flatMap { entry =>
+      val source = Paths.get(entry.source)
+      val output = Paths.get(outputBasePath, entry.output.stripPrefix("/"))
+      if (Files.exists(source)) Some(source)
+      else if (Files.exists(output)) Some(output)
+      else None
+    }
     
-    manifestPath match {
-      case Some(relPath) =>
-        // Manifest provides relative path like "js/site.js" or "css/site.css"
-        // Resolve against output base first (for compiled assets), then source dirs
-        val outputResolved = Paths.get(outputBasePath, relPath)
-        if (Files.exists(outputResolved)) outputResolved
-        else {
-          // Strip the type prefix (js/ or css/) and look in source dirs
-          val stripped = relPath.replaceFirst("^(js|css)/", "")
-          val sourceBase = if (ext == "css" || relPath.startsWith("css/")) siteCssPath else siteJsPath
-          val sourceResolved = Paths.get(sourceBase, stripped)
-          if (Files.exists(sourceResolved)) sourceResolved
-          else {
-            // Final fallback: try convention-based resolution
-            val (basePath, filePath) = resolveModulePathByConvention(module, ext)
-            Paths.get(basePath, filePath)
-          }
-        }
-      case None =>
-        // 2. Fallback to convention-based resolution
-        val (basePath, filePath) = resolveModulePathByConvention(module, ext)
-        Paths.get(basePath, filePath)
+    fromManifest.getOrElse {
+      val (basePath, filePath) = resolveModulePathByConvention(module, ext)
+      Paths.get(basePath, filePath)
     }
   }
   
@@ -379,7 +386,7 @@ class PasteComboHandler(
    * Webjar support for paste.ui.* can be added if needed in the future.
    */
   private def resolveModulePathByConvention(module: String, ext: String): (String, String) = {
-    // Site modules: site.home -> siteAssetsPath/site.js
+    // Site modules: {sitePrefix}.home -> siteJsPath/home.js
     // paste.ui.* -> paste-elements/modules/
     // paste.* -> paste/src/js/ (checks webjar first)
     
@@ -390,7 +397,7 @@ class PasteComboHandler(
         val webjarPath = findInWebjars("paste-webjar", webjarRelPath)
         webjarPath.getOrElse((pastePath, s"paste.$ext"))
       case m if m.startsWith(s"$sitePrefix.") =>
-        // Site-specific module: site.home -> site.js or site.scss
+        // Site-specific module: {sitePrefix}.home -> home.js or home.scss
         val component = m.stripPrefix(s"$sitePrefix.")
         val basePath = if (ext == "css") siteCssPath else siteJsPath
         (basePath, s"$component.$ext")
