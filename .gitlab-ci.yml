@@ -4,17 +4,17 @@
 
 include:
   - project: 'tomshley/brands/global/tware/tech/products/provisioning/cicd-pipelines'
-    ref: 'v0.9.1'
+    ref: 'v0.10.0'
     file: '/adapters/gitlab/ci/adapter.yml'
 
 variables:
-  CICD_PIPELINES_RUNNER_TAG: "0.9.1"
+  CICD_PIPELINES_RUNNER_TAG: "0.10.0"
   BASE_CONTAINERS_REGISTRY: registry.gitlab.com/tomshley/brands/global/tware/tech/products/provisioning/base-containers
-  BASE_CONTAINERS_UPSTREAM_TAG: "0.5.0"
+  BASE_CONTAINERS_UPSTREAM_TAG: "0.6.0"
   # One Rust toolchain for build, test, and publish: the one baked into
   # CICD_PIPELINES_RUST_IMAGE. Cargo.toml's rust-version and the oxc pin track it.
   TOMSHLEY_CICD_CARGO_BINARY: paste-assetgraph
-  TOMSHLEY_CICD_CARGO_TARGETS: "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-gnu"
+  TOMSHLEY_CICD_CARGO_TARGETS: "x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-gnu"
   TOMSHLEY_CICD_CARGO_NATIVE_ROOT: runtime/scala/sbt-plugin/src/main/resources/native
   DETERMINISM_CONFIG: features/determinism.conf
   DETERMINISM_REFERENCE: .determinism/linux
@@ -143,7 +143,7 @@ determinism-linux:
   stage: test
   needs: [build-rust]
   script:
-    - target/x86_64-unknown-linux-gnu/release/paste-assetgraph build --config "${DETERMINISM_CONFIG}"
+    - target/x86_64-unknown-linux-musl/release/paste-assetgraph build --config "${DETERMINISM_CONFIG}"
     - mkdir -p "${DETERMINISM_REFERENCE}"
     - cp features/dist/manifest.json "${DETERMINISM_REFERENCE}/manifest.json"
     - cp features/dist/js/assetgraph.js "${DETERMINISM_REFERENCE}/assetgraph.js"

@@ -226,11 +226,33 @@ jam.base-path = "/paste"
 """
   }
   
+  private[sbt] def validatedWebjarPaths(extractDir: File, relativePath: String): (File, File) = {
+    val parts = relativePath.split("/", -1).toSeq
+    val safeSegments = parts.size >= 3 && parts.forall { part =>
+      part.nonEmpty && part != "." && part != ".." &&
+        !part.exists(character => character == '\\' || character == ':' || Character.isISOControl(character))
+    }
+    require(safeSegments, "Unsafe WebJar archive entry")
+
+    val root = extractDir.getCanonicalFile.toPath
+    val directory = root.resolve(parts(0)).resolve(parts(1))
+    val file = parts.drop(2).foldLeft(directory)((path, part) => path.resolve(part))
+    val canonicalDirectory = directory.toFile.getCanonicalFile.toPath
+    val canonicalFile = file.toFile.getCanonicalFile.toPath
+    require(
+      canonicalDirectory == directory && canonicalFile == file &&
+        canonicalDirectory.startsWith(root) && canonicalDirectory != root &&
+        canonicalFile.startsWith(canonicalDirectory) && canonicalFile != canonicalDirectory,
+      "Unsafe WebJar archive entry"
+    )
+    (canonicalDirectory.toFile, canonicalFile.toFile)
+  }
+
   /**
    * Extract webjars from classpath JARs to target directory.
    * Returns Seq of extracted top-level directories.
    */
-  private def extractWebjars(classpath: Classpath, extractDir: File, log: Logger): Seq[String] = {
+  private[sbt] def extractWebjars(classpath: Classpath, extractDir: File, log: Logger): Seq[String] = {
     val webjarPrefix = "META-INF/resources/webjars/"
     val extractedPaths = mutable.Set[String]()
     val extractedDirs = mutable.Set[String]()
@@ -255,10 +277,7 @@ jam.base-path = "/paste"
               
               // Require artifactId, version, AND a non-empty file path
               if (parts.length >= 3 && parts(2).nonEmpty) {
-                val artifactId = parts(0)
-                val version = parts(1)
-                val targetDir = extractDir / artifactId / version
-                val targetFile = targetDir / parts.drop(2).mkString("/")
+                val (targetDir, targetFile) = validatedWebjarPaths(extractDir, relativePath)
                 
                 // Check if already extracted and up-to-date
                 val markerFile = targetDir / ".extracted"
@@ -295,6 +314,7 @@ jam.base-path = "/paste"
           extractedDirs.clear()
           
         } catch {
+          case e: IllegalArgumentException => throw e
           case e: Exception =>
             log.warn(s"Failed to extract webjars from ${jar.getName}: ${e.getMessage}")
         } finally {

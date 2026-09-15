@@ -33,13 +33,13 @@ paste-assetgraph/
 The release assets are available on the
 [GitLab Releases page](https://gitlab.com/tomshley/brands/global/tware/tech/products/paste/paste-assetgraph/-/releases).
 Assets are named `paste-assetgraph-darwin-aarch64`, `paste-assetgraph-darwin-amd64`,
-`paste-assetgraph-linux-amd64`, `paste-assetgraph-linux-aarch64`, and
+`paste-assetgraph-linux-amd64-musl`, `paste-assetgraph-linux-aarch64-musl`, and
 `paste-assetgraph-windows-amd64.exe`. Download the matching binary and `SHA256SUMS`, then verify:
 
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing
-chmod +x paste-assetgraph-<os>-<arch>
-./paste-assetgraph-<os>-<arch> --version
+chmod +x paste-assetgraph-<platform>
+./paste-assetgraph-<platform> --version
 ```
 
 On Windows PowerShell:
@@ -48,6 +48,8 @@ On Windows PowerShell:
 (Get-FileHash .\paste-assetgraph-windows-amd64.exe -Algorithm SHA256).Hash
 .\paste-assetgraph-windows-amd64.exe --version
 ```
+
+Linux release binaries are statically linked for musl and run on both Alpine and glibc-based Linux distributions. The sbt plugin selects these binaries on Linux without requiring a glibc compatibility layer.
 
 ### Build from source
 

@@ -34,6 +34,22 @@ final class BinarySpec extends AnyFunSuite with BeforeAndAfterEach {
     super.afterEach()
   }
 
+  Seq(
+    ("Linux", "amd64", "linux-amd64-musl"),
+    ("Linux", "x86_64", "linux-amd64-musl"),
+    ("Linux", "aarch64", "linux-aarch64-musl"),
+    ("Linux", "arm64", "linux-aarch64-musl"),
+    ("Mac OS X", "aarch64", "darwin-aarch64"),
+    ("Mac OS X", "x86_64", "darwin-amd64"),
+    ("Windows 11", "amd64", "windows-amd64")
+  ).foreach { case (os, arch, expected) =>
+    test(s"selects $expected for $os on $arch") {
+      System.setProperty("os.name", os)
+      System.setProperty("os.arch", arch)
+      assert(Binary.platformName == expected)
+    }
+  }
+
   test("extracts the platform binary into a directory named for the plugin version") {
     val target = Files.createTempDirectory("paste-assetgraph-binary-spec")
     System.setProperty("paste.assetgraph.version", "0.1.0-develop-a1b2c3d")

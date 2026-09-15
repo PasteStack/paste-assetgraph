@@ -148,7 +148,10 @@ object Binary {
       try readResource(stream) finally stream.close()
     }
 
-  private def platformName: String = s"$osName-$archName"
+  private[assetgraph] def platformName: String = osName match {
+    case "linux" => s"linux-$archName-musl"
+    case os => s"$os-$archName"
+  }
 
   private def osName: String =
     Option(System.getProperty("os.name"))
