@@ -35,13 +35,34 @@ case class Manifest(
 ) {
   
   /**
-   * Lookup module file path from manifest's modules map.
-   * Returns None if module not found (fallback to convention).
+   * Lookup a declared module's asset key from the manifest's modules map.
+   * Returns None if the module was not declared (fallback to convention).
    */
   def resolveModule(moduleName: String): Option[String] = {
     modules.get(moduleName)
   }
   
+  /**
+   * Resolve a declared module name to the key of its asset of `assetType`.
+   *
+   * The modules map wins when it names an existing asset of that type — a
+   * stylesheet may declare a module name unrelated to its path. It is ignored
+   * when it does not, which is what lets a manifest written by an older build
+   * (whose modules map held source paths) still resolve by convention.
+   */
+  def assetKeyFor(moduleName: String, assetType: String): Option[String] = {
+    val declared = resolveModule(moduleName)
+      .filter(key => key.endsWith(s".$assetType") && assets.contains(key))
+    declared.orElse {
+      val conventional = s"$assetType/${moduleName.replace('.', '/')}.$assetType"
+      if (assets.contains(conventional)) Some(conventional) else None
+    }
+  }
+
+  /** The asset entry for a declared module name, for a given asset type. */
+  def assetFor(moduleName: String, assetType: String): Option[AssetEntry] =
+    assetKeyFor(moduleName, assetType).flatMap(assets.get)
+
   /**
    * Resolve source path to versioned output path.
    */
@@ -97,14 +118,12 @@ case class Manifest(
   private def jamUrlForType(modules: Seq[String], assetType: String, debug: Boolean): String = {
     var latestTimestamp: Long = 0L
     val moduleVersions = modules.map { m =>
-      // Intentionally unfiltered by asset type: jamUrlForType needs cross-type
-      // version/timestamp lookup for cache busting. The server and
-      // expandDependencies/getDependencies DO filter by type for content serving.
-      val assetKey = resolveModule(m)
-        .orElse {
-          val directKey = s"$assetType/${m.replace('.', '/')}.$assetType"
-          if (assets.contains(directKey)) Some(directKey) else None
-        }
+      // Intentionally falls back across asset types: this URL needs a version
+      // and timestamp for cache busting even when the requested type has no
+      // asset for the module. The server and expandDependencies/getDependencies
+      // stay type-filtered for content serving.
+      val assetKey = assetKeyFor(m, assetType)
+        .orElse(resolveModule(m).filter(assets.contains))
       
       assetKey.flatMap(assets.get) match {
         case Some(e) =>
@@ -145,41 +164,42 @@ case class Manifest(
    * 
    * If bundle size is under inlineThreshold bytes, inlines the entire bundle.
    * 
+   * An empty module list produces no markup: the loading-assignment chain and
+   * the combo URL both need at least one module to be valid.
+   *
    * @param modules Module names to load
    * @param cdnBase CDN base URL (e.g., "//cdn.example.com")
    * @param inlineThreshold If bundle size < this, inline it (0 = never inline)
-   * @return HTML script tag(s)
+   * @return HTML script tag(s), or an empty string for no modules
    */
   def jamBootstrap(
     modules: Seq[String],
     cdnBase: String = "",
     inlineThreshold: Int = 0
   ): String = {
-    val url = cdnBase + jamJsUrl(modules, debug = false)
-    
     // Expand dependencies so all transitive deps are marked as loading,
     // preventing duplicate requests if another script also loads a shared dep.
     val allModules = expandDependencies(modules)
+    if (allModules.isEmpty) return ""
+
+    val url = cdnBase + jamJsUrl(modules, debug = false)
     
     // Build isLoading assignments: d('paste.dom').isLoading=d('paste.event').isLoading=!0
     val loadingAssignments = allModules.map(m => s"d('$m').isLoading").mkString("=") + "=!0"
     
     // Check if we should inline
     if (inlineThreshold > 0) {
-      // Read content first, then check total size.
-      // We cannot rely on entry.source paths (build-time absolute paths)
-      // being available at runtime — they may not exist in production.
-      val contentParts: Seq[String] = modules.flatMap { m =>
-        val key = s"js/${m.replace('.', '/')}.js"
-        assets.get(key).map(_.source)
-      }.flatMap { path =>
-        readFile(path)
-      }
+      // Read content first, then check total size. Source labels are recorded
+      // relative to the project root, so this resolves where the process runs
+      // from that root (development); it degrades to no inlining elsewhere.
+      val contentParts: Seq[String] = modules
+        .flatMap(m => assetFor(m, "js").map(_.source))
+        .flatMap(readFile)
       
       val totalSize = contentParts.map(_.length.toLong).sum
       
       if (totalSize > 0 && totalSize < inlineThreshold) {
-        val content = contentParts.mkString("\n")
+        val content = contentParts.mkString(Manifest.JsConcatSeparator)
         return s"""<script type="text/javascript">(function(d){$loadingAssignments;})(paste.define);$content</script>"""
       }
     }
@@ -189,12 +209,11 @@ case class Manifest(
   }
   
   /**
-   * Generate bootstrap for CSS modules.
+   * Generate bootstrap for CSS modules. An empty module list produces no markup.
    */
-  def jamCssBootstrap(modules: Seq[String], cdnBase: String = ""): String = {
-    val url = cdnBase + jamCssUrl(modules, debug = false)
-    s"""<link rel="stylesheet" href="$url"/>"""
-  }
+  def jamCssBootstrap(modules: Seq[String], cdnBase: String = ""): String =
+    if (modules.isEmpty) ""
+    else s"""<link rel="stylesheet" href="${cdnBase + jamCssUrl(modules, debug = false)}"/>"""
   
   /**
    * Read file content from filesystem (for inlining).
@@ -210,7 +229,13 @@ case class Manifest(
    * Read file content from classpath resource (for inlining).
    */
   def readResource(resourcePath: String): Option[String] = {
-    val stream = getClass.getResourceAsStream(resourcePath)
+    val cl = Option(Thread.currentThread().getContextClassLoader)
+      .orElse(Option(getClass.getClassLoader))
+      .orNull
+    val stream = if (cl != null)
+      cl.getResourceAsStream(resourcePath.stripPrefix("/"))
+    else
+      getClass.getResourceAsStream(resourcePath)
     if (stream == null) None
     else scala.util.Try {
       val source = scala.io.Source.fromInputStream(stream)
@@ -218,6 +243,27 @@ case class Manifest(
     }.toOption
   }
   
+  /**
+   * Generate complete JAM bootstrap with paste.js auto-discovered from the webjar on the classpath.
+   * Uses pom.properties to resolve the version, so no hardcoded version is needed in templates.
+   * Falls back with a warning if paste-webjar is not on the runtime classpath.
+   *
+   * @param modules Module names to load via combo URL
+   * @param cdnBase CDN base URL for combo URL
+   * @return Complete HTML with inlined paste.js + module loader
+   */
+  def jamInlineBootstrap(
+    modules: Seq[String],
+    cdnBase: String = ""
+  ): String =
+    Manifest.webjarResource("paste-webjar", "src/js/paste.js") match {
+      case Some(path) => jamInlineBootstrap(path, modules, cdnBase)
+      case None =>
+        System.err.println("[paste-assetgraph] WARNING: paste-webjar not found on classpath via pom.properties. " +
+          "Ensure AssetGraphPlugin.withPaste() is in build.sbt and the webjar is on the runtime classpath.")
+        jamBootstrap(modules, cdnBase, 0)
+    }
+
   /**
    * Generate complete JAM bootstrap with paste.js inlined.
    * 
@@ -230,10 +276,13 @@ case class Manifest(
    * @param cdnBase CDN base URL for combo URL
    * @return Complete HTML with inlined paste.js + module loader
    */
+  def jamInlineBootstrap(pasteJsPath: String, modules: Seq[String]): String =
+    jamInlineBootstrap(pasteJsPath, modules, "")
+
   def jamInlineBootstrap(
     pasteJsPath: String,
     modules: Seq[String],
-    cdnBase: String = ""
+    cdnBase: String
   ): String = {
     // Read paste.js content
     val pasteJsContent = if (pasteJsPath.startsWith("/")) {
@@ -246,22 +295,33 @@ case class Manifest(
       case Some(content) =>
         // Expand all dependencies
         val allModules = expandDependencies(modules)
-        val url = cdnBase + jamJsUrl(allModules, debug = false)
-        
-        // Pre-mark all modules as isLoading to prevent duplicate requests
-        val loadingAssignments = allModules.map(m => s"d('$m').isLoading").mkString("=") + "=!0"
         
         // Calculate base URL for dynamic loading (timestamp portion)
         val cleanVer = version.filter(_ != '\u0000')
         val timestamp = if (cleanVer.nonEmpty) cleanVer else "0"
         val packagesUrl = s"$cdnBase/paste/$timestamp/"
+        val runtime =
+          s"""<script type="text/javascript">$content;paste.config({packagesUrl:'$packagesUrl'});</script>"""
         
-        // Inline paste.js, configure packages URL, then load modules
-        s"""<script type="text/javascript">$content;paste.config({packagesUrl:'$packagesUrl'});</script>
+        if (allModules.isEmpty) {
+          // No modules requested: paste.js is configured, nothing to load.
+          runtime
+        } else {
+          val url = cdnBase + jamJsUrl(allModules, debug = false)
+          // Pre-mark all modules as isLoading to prevent duplicate requests
+          val loadingAssignments = allModules.map(m => s"d('$m').isLoading").mkString("=") + "=!0"
+
+          // Inline paste.js, configure packages URL, then load modules
+          s"""$runtime
 <script type="text/javascript">(function(d,r){$loadingAssignments;r('$url');})(paste.define,paste.require);</script>"""
+        }
         
       case None =>
-        // Fallback - just use jamBootstrap without inlined paste.js
+        // paste.js not found at the given path — page will break at runtime.
+        // Log a warning so this is not silent.
+        System.err.println(s"[paste-assetgraph] WARNING: paste.js not found at '$pasteJsPath'. " +
+          "Falling back to jamBootstrap (paste.js will not be loaded — page JS will break). " +
+          "Check that the webjar is on the runtime classpath and the path is correct.")
         jamBootstrap(modules, cdnBase, 0)
     }
   }
@@ -278,11 +338,7 @@ case class Manifest(
       if (visited.contains(m)) return
       visited += m
       
-      // Resolve via modules map first (filtered to matching type), then direct key
-      val directKey = s"$assetType/${m.replace(".", "/")}.$assetType"
-      val entryOpt = resolveModule(m).filter(_.endsWith(s".$assetType")).flatMap(assets.get)
-        .orElse(assets.get(directKey))
-      entryOpt match {
+      assetFor(m, assetType) match {
         case Some(entry) =>
           entry.dependencies.foreach(visit)
           result :+= m
@@ -309,11 +365,7 @@ case class Manifest(
       if (visited.contains(m)) return
       visited += m
       
-      // Resolve via modules map first (filtered to matching type), then direct key
-      val directKey = s"$assetType/${m.replace(".", "/")}.$assetType"
-      val entryOpt = resolveModule(m).filter(_.endsWith(s".$assetType")).flatMap(assets.get)
-        .orElse(assets.get(directKey))
-      entryOpt match {
+      assetFor(m, assetType) match {
         case Some(entry) =>
           entry.dependencies.foreach(visit)
           result :+= m
@@ -334,10 +386,17 @@ object Manifest extends DefaultJsonProtocol {
   /** Sorted dependency entry: (module_name, output_path, version) */
   type SortedDepEntry = (String, String, Int)
   
-  implicit val assetVersionFormat: RootJsonFormat[AssetVersion] = jsonFormat4(AssetVersion)
+  /**
+   * Statement separator for concatenated JavaScript. A bare newline lets one
+   * module's trailing expression merge with the next module's leading
+   * parenthesis into a call; an explicit empty statement terminates it.
+   */
+  val JsConcatSeparator: String = "\n;\n"
+
+  implicit val assetVersionFormat: RootJsonFormat[AssetVersion] = jsonFormat4(AssetVersion.apply)
   
   implicit val assetEntryFormat: RootJsonFormat[AssetEntry] = jsonFormat(
-    AssetEntry, "source", "output", "hash", "version", "timestamp", "dependencies", "history"
+    AssetEntry.apply, "source", "output", "hash", "version", "timestamp", "dependencies", "history"
   )
   
   implicit object SortedDepEntryFormat extends RootJsonFormat[SortedDepEntry] {
@@ -406,6 +465,48 @@ object Manifest extends DefaultJsonProtocol {
     scala.util.Try(loadFromResource("/paste-assetgraph-manifest.json")).toOption
   }
   
+  private val webjarResourceCache: scala.collection.concurrent.TrieMap[(String, String, String, Int), Option[String]] =
+    scala.collection.concurrent.TrieMap.empty
+
+  private[assetgraph] def clearWebjarCache(): Unit = webjarResourceCache.clear()
+
+  /**
+   * Discover a webjar classpath resource path without hardcoding the version.
+   * Reads the version from META-INF/maven/{groupId}/{artifactId}/pom.properties,
+   * then constructs the full webjar resource path.
+   *
+   * Note: the returned path has a leading `/` suitable for `Class.getResourceAsStream`
+   * or `readResource`. Do not strip the `/` before passing to `ClassLoader.getResourceAsStream`.
+   *
+   * The cache key includes the classloader identity hash so that sbt reload
+   * (which creates a new classloader with updated webjars) does not serve stale paths.
+   *
+   * @param artifactId The webjar artifact ID (e.g. "paste-webjar")
+   * @param filePath   The file path within the webjar (e.g. "src/js/paste.js")
+   * @param groupId    The Maven group ID (defaults to "com.pastestack")
+   * @return The full classpath resource path, or None if the webjar is not on the classpath
+   */
+  def webjarResource(artifactId: String, filePath: String, groupId: String = "com.pastestack"): Option[String] = {
+    val cl = Option(Thread.currentThread().getContextClassLoader)
+      .orElse(Option(getClass.getClassLoader))
+      .orNull
+    if (cl == null) return None
+    val clId = System.identityHashCode(cl)
+    webjarResourceCache.getOrElseUpdate((artifactId, filePath, groupId, clId), {
+      val propsPath = s"META-INF/maven/$groupId/$artifactId/pom.properties"
+      val stream = cl.getResourceAsStream(propsPath)
+      if (stream == null) None
+      else scala.util.Try {
+        val props = new java.util.Properties()
+        try { props.load(stream) } finally { stream.close() }
+        val artifactVersion = props.getProperty("version")
+        if (artifactVersion != null && artifactVersion.nonEmpty)
+          Some(s"/META-INF/resources/webjars/$artifactId/$artifactVersion/$filePath")
+        else None
+      }.toOption.flatten
+    })
+  }
+
   /**
    * Empty manifest for fallback.
    */

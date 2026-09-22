@@ -9,7 +9,7 @@ Feature: Module Name Extraction
       | source_scss | src/scss |
 
   Scenario: Extract @module from JavaScript file
-    Given a JavaScript file "src/js/site.js" with content:
+    Given a JavaScript file "src/js/site/home.js" with content:
       """
       /**
        * Site module
@@ -21,7 +21,7 @@ Feature: Module Name Extraction
     When I build the asset manifest
     Then the manifest modules should contain:
       | module_name | file_path      |
-      | site.home    | js/site.js     |
+      | site.home    | js/site/home.js     |
 
   Scenario: Extract @module from SCSS file
     Given an SCSS file "src/scss/theme.scss" with content:
@@ -66,20 +66,20 @@ Feature: Module Name Extraction
   Scenario: Handle multiple modules in same build
     Given JavaScript files:
       | path                 | module_comment           |
-      | src/js/site.js       | @module site/home         |
-      | src/js/analytics.js  | @module site/analytics    |
+      | src/js/site/home.js       | @module site/home         |
+      | src/js/site/analytics.js  | @module site/analytics    |
     When I build the asset manifest
     Then the manifest modules should contain:
       | module_name    | file_path          |
-      | site.home       | js/site.js         |
-      | site.analytics  | js/analytics.js    |
+      | site.home       | js/site/home.js         |
+      | site.analytics  | js/site/analytics.js    |
 
   Scenario: Resolve module from manifest in combo handler
     Given a manifest with modules:
       | module_name | file_path      |
-      | site.home    | js/site.js     |
+      | site.home    | js/site/home.js     |
     When the combo handler receives request for "site.home"
-    Then it should load from "js/site.js"
+    Then it should load from "js/site/home.js"
     And NOT use filename convention fallback
 
   Scenario: Combo handler fallback when module not in manifest

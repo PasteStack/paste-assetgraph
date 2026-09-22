@@ -1,15 +1,31 @@
 # Rust
+# Cargo.lock is committed: this crate ships a binary, and CI builds and tests it
+# with --locked so the published binary is built from reviewed dependencies.
 target/
-Cargo.lock
 
 # IDE
 .idea/
 *.iml
 .vscode/
+.windsurf/
+
+# Secrets
+*.env
+.secure_files/*
+!.secure_files/
+!.secure_files/*.example
+cache.config
+credentials.config
+endpoint.config
+
+# Native binaries and their checksum manifest (built by CI via cargo-zigbuild
+# for every configured target, never committed). The plugin's test fixtures
+# under src/test/resources/native/ are committed and unaffected.
+runtime/scala/sbt-plugin/src/main/resources/native/
+
+# Output of the determinism fixture build
+features/dist/
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Snyk Security Extension - AI Rules (auto-generated)
-.windsurf/rules/snyk_rules.md

@@ -499,7 +499,7 @@ class ManifestSpec extends AnyFlatSpec with Matchers {
     deps should contain inOrderOnly ("base", "theme")
   }
 
-  it should "include non-manifest modules without expansion (Bug #8 consistency fix)" in {
+  it should "include non-manifest modules without expansion, matching jamUrlForType" in {
     // expandDependencies should include unknown modules (without expanding deps),
     // matching jamUrlForType behavior which also includes them with default v1.0.
     val manifest = Manifest(

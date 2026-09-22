@@ -1,0 +1,228 @@
+# Copyright (c) 2024–2026 Tomshley
+#
+# Licensed under the Apache License, Version 2.0
+
+include:
+  - project: 'tomshley/brands/global/tware/tech/products/provisioning/cicd-pipelines'
+    ref: 'v0.10.0'
+    file: '/adapters/gitlab/ci/adapter.yml'
+
+variables:
+  CICD_PIPELINES_RUNNER_TAG: "0.10.0"
+  BASE_CONTAINERS_REGISTRY: registry.gitlab.com/tomshley/brands/global/tware/tech/products/provisioning/base-containers
+  BASE_CONTAINERS_UPSTREAM_TAG: "0.6.0"
+  # One Rust toolchain for build, test, and publish: the one baked into
+  # CICD_PIPELINES_RUST_IMAGE. Cargo.toml's rust-version and the oxc pin track it.
+  TOMSHLEY_CICD_CARGO_BINARY: paste-assetgraph
+  TOMSHLEY_CICD_CARGO_TARGETS: "x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-gnu"
+  TOMSHLEY_CICD_CARGO_NATIVE_ROOT: runtime/scala/sbt-plugin/src/main/resources/native
+  DETERMINISM_CONFIG: features/determinism.conf
+  DETERMINISM_REFERENCE: .determinism/linux
+
+# Branch and tag pipelines carry the build; merge request pipelines would only
+# duplicate them (the adapter's workflow admits both), and a five-target
+# cross-compile is not worth running twice. Tag pipelines must keep these jobs:
+# the publish and release jobs declare `needs` on them.
+.runs-on-branch-or-tag:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH'
+
+# Formatting is checked before anything is built: it needs only the sources, and a
+# drifting format is cheapest to catch first. rustfmt.toml pins the style edition so
+# every toolchain produces the same bytes.
+lint-rust:
+  extends: [.runs-on-branch-or-tag]
+  image: ${CICD_PIPELINES_RUST_IMAGE}
+  stage: .pre
+  script:
+    - cargo fmt --check
+
+build-rust:
+  extends: [.runs-on-branch-or-tag, .tomshley-cicd-cargo-zigbuild]
+  variables:
+    # The Darwin targets link system frameworks (chrono -> iana-time-zone ->
+    # core-foundation-sys links CoreFoundation), which needs a macOS SDK. The
+    # runner image ships no SDK, so the job supplies one and points SDKROOT at
+    # it: cargo-zigbuild reads SDKROOT and passes the sysroot, include, library,
+    # and framework paths to the linker for apple-darwin targets only. Nothing
+    # is added to RUSTFLAGS, so the Linux and Windows targets are unaffected.
+    MACOS_SDK_VERSION: "14.5"
+    SDKROOT: "${CI_PROJECT_DIR}/.macos-sdk/MacOSX${MACOS_SDK_VERSION}.sdk"
+    # The SDK enters the linker path for the published Darwin binaries, so the
+    # download is pinned by content, not only by tag: a release asset can be
+    # replaced, a tag can be moved, and neither would be visible in a build log.
+    MACOS_SDK_SHA256: "6e146275d19f027faa2e8354da5e0267513abf013b8f16ad65a231653a2b1c5d"
+  cache:
+    key: macos-sdk-${MACOS_SDK_VERSION}
+    paths:
+      - .macos-sdk/
+  before_script:
+    - |
+      if [ -d "${SDKROOT}" ]; then
+        echo "Using cached macOS SDK ${MACOS_SDK_VERSION} at ${SDKROOT}"
+      else
+        echo "Downloading macOS SDK ${MACOS_SDK_VERSION}"
+        mkdir -p .macos-sdk
+        curl --fail --silent --show-error --location \
+          --output "MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+          "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+        echo "${MACOS_SDK_SHA256}  MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" | sha256sum -c -
+        tar -xf "MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" -C .macos-sdk/
+        rm "MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+      fi
+      test -d "${SDKROOT}" || { echo "macOS SDK missing at ${SDKROOT}" >&2; exit 1; }
+  script:
+    - !reference [.tomshley-cicd-cargo-zigbuild, script]
+    - |
+      # The release recipe uploads each binary as <binary>-<platform>[.exe], so
+      # the checksum file must name those files for `sha256sum -c SHA256SUMS` to
+      # verify a directory of downloaded assets. The build recipe writes the
+      # checksums under their native-resource paths, which no download carries;
+      # rewrite them from the layout it just produced. The plugin's own
+      # verification uses native/manifest.json and is untouched.
+      rm -rf .release-assets
+      mkdir -p .release-assets
+      for binary in "${TOMSHLEY_CICD_CARGO_NATIVE_ROOT}"/*/"${TOMSHLEY_CICD_CARGO_BINARY}"*; do
+        [ -f "${binary}" ] || { echo "no native binaries under ${TOMSHLEY_CICD_CARGO_NATIVE_ROOT}" >&2; exit 1; }
+        platform="$(basename "$(dirname "${binary}")")"
+        suffix="$(basename "${binary}")"
+        suffix="${suffix#"${TOMSHLEY_CICD_CARGO_BINARY}"}"
+        cp "${binary}" ".release-assets/${TOMSHLEY_CICD_CARGO_BINARY}-${platform}${suffix}"
+      done
+      (cd .release-assets && sha256sum -- *) > SHA256SUMS
+      cat SHA256SUMS
+  artifacts:
+    paths:
+      - target/*/release/paste-assetgraph*
+      - runtime/scala/sbt-plugin/src/main/resources/native/
+      - SHA256SUMS
+    expire_in: 1 hour
+
+test-rust:
+  extends: [.runs-on-branch-or-tag]
+  image: ${CICD_PIPELINES_RUST_IMAGE}
+  stage: test
+  needs: [build-rust]
+  script:
+    - cargo test --locked
+
+build-sbt:
+  extends: [.runs-on-branch-or-tag]
+  image: ${CICD_PIPELINES_REGISTRY}/cicd-runner-sbtdockertofu:${CICD_PIPELINES_RUNNER_TAG}
+  stage: build
+  needs: [build-rust]
+  script:
+    - cd runtime/scala
+    - sbt compile
+    - cd sbt-plugin
+    - sbt compile package
+  artifacts:
+    paths: [runtime/scala/**/target/]
+    expire_in: 1 hour
+
+test-sbt:
+  extends: [.runs-on-branch-or-tag]
+  image: ${CICD_PIPELINES_REGISTRY}/cicd-runner-sbtdockertofu:${CICD_PIPELINES_RUNNER_TAG}
+  stage: test
+  needs: [build-sbt]
+  script:
+    - cd runtime/scala
+    - sbt test
+    - cd sbt-plugin
+    - sbt test
+
+# A dist build must produce byte-identical output on every platform, because the
+# manifest and the rollups are committed artifacts consumers diff. The Linux run
+# publishes the reference bytes; the Windows run rebuilds and compares them.
+determinism-linux:
+  extends: [.runs-on-branch-or-tag]
+  image: ${CICD_PIPELINES_RUST_IMAGE}
+  stage: test
+  needs: [build-rust]
+  script:
+    - target/x86_64-unknown-linux-musl/release/paste-assetgraph build --config "${DETERMINISM_CONFIG}"
+    - mkdir -p "${DETERMINISM_REFERENCE}"
+    - cp features/dist/manifest.json "${DETERMINISM_REFERENCE}/manifest.json"
+    - cp features/dist/js/assetgraph.js "${DETERMINISM_REFERENCE}/assetgraph.js"
+    - cp features/dist/css/assetgraph.css "${DETERMINISM_REFERENCE}/assetgraph.css"
+    - sha256sum "${DETERMINISM_REFERENCE}"/*
+  artifacts:
+    paths: ["${DETERMINISM_REFERENCE}"]
+    expire_in: 1 hour
+
+determinism-windows:
+  extends: [.runs-on-branch-or-tag]
+  stage: test
+  tags: [saas-windows-medium-amd64]
+  needs: [build-rust, determinism-linux]
+  script:
+    - .\target\x86_64-pc-windows-gnu\release\paste-assetgraph.exe build --config $env:DETERMINISM_CONFIG
+    - |
+      $rebuilt = @{
+        'manifest.json'  = 'features/dist/manifest.json'
+        'assetgraph.js'  = 'features/dist/js/assetgraph.js'
+        'assetgraph.css' = 'features/dist/css/assetgraph.css'
+      }
+      foreach ($name in $rebuilt.Keys) {
+        $linux = (Get-FileHash "$env:DETERMINISM_REFERENCE/$name" -Algorithm SHA256).Hash
+        $windows = (Get-FileHash $rebuilt[$name] -Algorithm SHA256).Hash
+        if ($linux -ne $windows) {
+          throw "$name differs between platforms: linux $linux, windows $windows"
+        }
+        Write-Host "$name matches on both platforms ($windows)"
+      }
+
+# Publishing waits for every test that judges the binaries being published —
+# including the cross-platform determinism check, which no later job can undo.
+publish-cli:
+  extends: [.tomshley-cicd-publish-cargo]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - if: '$TOMSHLEY_CICD_FLOW_TYPE == "develop"'
+      when: on_success
+    - if: '$TOMSHLEY_CICD_FLOW_TYPE =~ /^(feature|hotfix|release)$/'
+      when: manual
+      allow_failure: true
+    - if: '$CI_COMMIT_BRANCH'
+      when: manual
+      allow_failure: true
+  needs: [build-rust, test-rust, determinism-linux, determinism-windows]
+
+# The recipe publishes one coordinate — the pinnable {ref-slug}-{sha}. A consumer
+# cannot track a branch by a version that changes every pipeline, so the rolling
+# {ref-slug}-latest coordinate is published after it. On a tag both revisions are
+# empty and the clean version publishes once, so the second pass is skipped.
+publish-maven:
+  extends: [.tomshley-cicd-publish-sbt]
+  needs: [build-rust, test-rust, test-sbt, determinism-linux, determinism-windows]
+  variables:
+    TOMSHLEY_CICD_PUBLISH_PROJECT_ID: "70289607"
+  before_script:
+    # The recipe script resolves the publish policy in its own process, so the
+    # job shell needs it too before it can decide whether a rolling pass applies.
+    - !reference [.tomshley-cicd-recipe-env, before_script]
+    - !reference [.before-artifact-tags, before_script]
+  script:
+    - cd runtime/scala
+    - bash "${TOMSHLEY_CICD_TOOLBOX_ROOT}/publish/sbt.sh" sbt +runtime/publish +pekko/publish
+    - cd sbt-plugin
+    - bash "${TOMSHLEY_CICD_TOOLBOX_ROOT}/publish/sbt.sh" sbt publish
+    - |
+      if [ "${CICD_PUBLISH_ROLLING}" = "true" ]; then
+        cd "${CI_PROJECT_DIR}/runtime/scala"
+        TOMSHLEY_CICD_BUILD_REVISION="${CICD_PUBLISH_ROLLING_TAG}" sbt +runtime/publish +pekko/publish
+        cd sbt-plugin
+        TOMSHLEY_CICD_BUILD_REVISION="${CICD_PUBLISH_ROLLING_TAG}" sbt publish
+      fi
+
+release-assets:
+  extends: [.tomshley-cicd-release-assets]
+  needs: [build-rust, test-rust, determinism-linux, determinism-windows]
+  variables:
+    TOMSHLEY_CICD_RELEASE_CHECKSUM_FILE: SHA256SUMS

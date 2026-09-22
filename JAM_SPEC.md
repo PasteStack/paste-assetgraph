@@ -165,25 +165,35 @@ SCSS/CSS files use the same format:
 
 ### Module Name Resolution Priority
 
-When resolving a module name to a file path:
+When resolving a module name to its asset:
 
-1. **Manifest lookup** (preferred) - Check if module name exists in manifest's `modules` map
-2. **Filename convention** (fallback) - Use naming convention based on prefix
+1. **Manifest lookup** (preferred) - the `modules` map names the module's key in
+   the `assets` map, for the requested asset type
+2. **Key convention** (fallback) - `{type}/{module with dots as slashes}.{type}`
 
 ### Manifest Module Map
 
-The manifest MUST include a `modules` section mapping declared names to file paths:
+The manifest MUST include a `modules` section mapping each declared name to the
+module's key in the `assets` map — never to a source path. A consumer resolves a
+module by looking that value up in `assets`, so a value that is not a key of
+`assets` is ignored in favour of the convention key:
 
 ```json
 {
   "modules": {
-    "paste.ui.heroscroll": "modules/heroscroll/heroscroll.js",
-    "paste.ui.stickynav": "modules/stickynav/stickynav.js",
-    "site.home": "js/site.js"
+    "paste.ui.heroscroll": "js/paste/ui/heroscroll.js",
+    "paste.ui.stickynav": "js/paste/ui/stickynav.js",
+    "site.home": "js/site/home.js",
+    "site.theme": "css/theme.css"
   },
   "assets": { ... }
 }
 ```
+
+A declared name need not match the file layout: `site.theme` above is declared by
+`theme.scss`, whose asset key stays `css/theme.css`. That is precisely why the
+map exists. Each asset entry carries its own `source`, recorded relative to the
+project root.
 
 ### Module Extraction
 
@@ -201,13 +211,13 @@ Each module in the manifest MUST include:
 
 ```json
 {
-  "source_path": "src/js/site.js",
+  "source_path": "src/js/home.js",
   "source_checksum": "abc123...",
   "name": "site.home",
   "dependencies": ["paste.dom", "paste.event", "paste.util"],
   "last_modified": 1387575212,
   "checksum": "def456...",
-  "path": "js/site.home.def456.v1.min.js",
+  "path": "js/site/home.def456.v1.min.js",
   "byte_size": 1234,
   "version": 1
 }
@@ -248,7 +258,7 @@ The manifest SHOULD include a `sorted_deps` section with pre-computed topologica
       ["paste.util", "js/paste.util.abc.v1.min.js", 1],
       ["paste.dom", "js/paste.dom.def.v1.min.js", 1],
       ["paste.event", "js/paste.event.ghi.v2.min.js", 2],
-      ["site.home", "js/site.home.jkl.v1.min.js", 1]
+      ["site.home", "js/site/home.jkl.v1.min.js", 1]
     ],
     "css": [...]
   }

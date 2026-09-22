@@ -2,9 +2,12 @@
 name = "paste-assetgraph"
 version = "0.1.0"
 edition = "2021"
+# Matches the Rust toolchain baked into the cicd-runner-sbtrustdockertofu image
+# (base-containers entry-rust). Raising this is a runner change, not a job-time install.
+rust-version = "1.83"
 authors = ["PasteStack Contributors"]
 description = "Asset pipeline for PasteStack with auto-versioning and dependency resolution"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/PasteStack/paste-assetgraph"
 
 [dependencies]
@@ -16,7 +19,7 @@ serde = { version = "1.0.193", features = ["derive"] }
 serde_json = "1.0"
 
 # File watching
-notify = "6.1"
+notify = { version = "6.1", default-features = false, features = ["crossbeam-channel", "macos_kqueue"] }
 
 # Hashing
 md5 = "0.7"
@@ -24,8 +27,12 @@ md5 = "0.7"
 # SCSS compilation
 grass = "0.13"
 
-# JS minification - use minify-js (simpler, no swc dependency issues)
-minify-js = "0.6"
+# JS minification - oxc parser + codegen (whitespace-only, faithful AST printer).
+# Replaced minify-js 0.6, which miscompiled constructor `function`s into arrow
+# functions and broke paste.js OOP (`new` -> "e is not a constructor").
+# Pinned to the newest release whose MSRV fits rust-version above (0.53+ needs 1.85,
+# 0.134+ needs 1.94); bump together with the runner toolchain.
+oxc = { version = "=0.52.0", features = ["codegen"] }
 
 # CSS minification
 lightningcss = "1.0.0-alpha.70"
