@@ -1,4 +1,6 @@
-# Unreleased
+# paste-assetgraph v0.2.0
+
+**Date:** 2026-09-22
 
 ## Fixed
 
