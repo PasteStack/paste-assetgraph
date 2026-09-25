@@ -1,139 +1,75 @@
 package com.pastestack.assetgraph.pekko
 
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.`Cache-Control`
-import org.apache.pekko.http.scaladsl.model.headers.CacheDirectives._
-import org.apache.pekko.http.scaladsl.server.Directives._
+import scala.concurrent.{ExecutionContext, Future}
+import org.apache.pekko.http.scaladsl.model.*
+import org.apache.pekko.http.scaladsl.model.headers.{Location, RawHeader}
+import org.apache.pekko.http.scaladsl.server.Directives.*
 import org.apache.pekko.http.scaladsl.server.Route
-import org.apache.pekko.util.ByteString
-import java.nio.charset.StandardCharsets
-import com.pastestack.assetgraph.{Manifest, PasteComboHandler}
+import com.pastestack.assetgraph.{ComboResponse, Paste}
 
 /**
- * Ready-to-use Pekko HTTP route for JAM combo URLs.
- * 
+ * Pekko HTTP route that delegates every URL under `paste.basePath` to the
+ * paste-assetgraph library via [[Paste.combo]].
+ *
  * Usage:
  * {{{
- * import com.pastestack.assetgraph.pekko.PasteComboRoute
- * 
- * val routes = concat(
- *   PasteComboRoute.route,
- *   // your other routes
- * )
+ * val paste = Paste.fromClasspath()
+ * val routes = concat(new PasteComboRoute(paste).route, ...)
  * }}}
- * 
- * Or with custom paths:
- * {{{
- * val comboRoute = new PasteComboRoute("../paste/src/js", "../paste-elements")
- * val routes = concat(comboRoute.route, ...)
- * }}}
+ *
+ * The match runs against the full request path — not the remaining path —
+ * so the route composes under an enclosing `pathPrefix`: set `basePath` to
+ * the complete prefix (e.g. `"/app/paste"` under `pathPrefix("app")`).
+ *
+ * The library decides status, cacheability, content type and body; this
+ * route only forwards them — including a 302's `location` as the `Location`
+ * header. Combo resolution runs on the default blocking-IO dispatcher since
+ * the library call reads files.
  */
-class PasteComboRoute(
-  pastePath: String = sys.env.getOrElse("PASTE_PATH", "../paste/src/js"),
-  pasteElementsPath: String = sys.env.getOrElse("PASTE_ELEMENTS_PATH", "../paste-elements"),
-  siteJsPath: String = sys.env.getOrElse("SITE_JS_PATH", "src/main/assets/js"),
-  siteCssPath: String = sys.env.getOrElse("SITE_CSS_PATH", "src/main/assets/scss"),
-  sitePrefix: String = sys.env.getOrElse("SITE_PREFIX", "site"),
-  manifest: Option[Manifest] = None,
-  outputBasePath: String = sys.env.getOrElse("PASTE_OUTPUT_PATH", "target/public"),
-  webjarBasePath: String = sys.env.getOrElse("PASTE_WEBJAR_PATH", "target/paste-assetgraph-webjars")
-) {
-  
-  private val handler = new PasteComboHandler(pastePath, pasteElementsPath, siteJsPath, siteCssPath, sitePrefix, manifest, outputBasePath, webjarBasePath)
-  
-  private def contentTypeFor(ext: String): ContentType = ext match {
-    case "js" => ContentType(MediaTypes.`application/javascript`, HttpCharsets.`UTF-8`)
-    case "css" => ContentType(MediaTypes.`text/css`, HttpCharsets.`UTF-8`)
-    case _ => ContentTypes.`text/plain(UTF-8)`
-  }
+final class PasteComboRoute(paste: Paste) {
 
-  /**
-   * Serve the modules named by a combo path.
-   *
-   * `cacheable` distinguishes the two URL shapes: a versioned path carries a
-   * timestamp segment and is immutable, so it may be cached for a year; an
-   * unversioned path has nothing to invalidate it and must not be.
-   */
-  private def serveModules(modulesWithExt: String, cacheable: Boolean): Route = get {
-    val (modules, ext, isMinified) = handler.parseModulesUrl(modulesWithExt)
-    val (content, foundCount) = handler.loadModulesWithCount(modules, ext, isMinified)
-    val contentType = contentTypeFor(ext)
-    val notFoundBody = if (modules.sizeIs > 1) "/* modules not found */" else "/* module not found */"
-
-    if (foundCount == 0) {
-      complete(HttpResponse(
-        status = StatusCodes.NotFound,
-        headers = List(`Cache-Control`(`no-cache`)),
-        entity = HttpEntity(contentType, ByteString(notFoundBody, StandardCharsets.UTF_8))
-      ))
-    } else {
-      val cacheControl =
-        if (cacheable) `Cache-Control`(`public`, `max-age`(31536000)) else `Cache-Control`(`no-cache`)
-      complete(HttpResponse(
-        status = StatusCodes.OK,
-        headers = List(cacheControl),
-        entity = HttpEntity(contentType, ByteString(content, StandardCharsets.UTF_8))
-      ))
+  val route: Route = get {
+    extractUri { uri =>
+      // Segment-anchored: a path that shares only a string prefix
+      // ("/pastebin/x") or the bare basePath is rejected for sibling
+      // routes; "/paste/" itself forwards and the library 404s it.
+      if (!uri.path.startsWith(Uri.Path(paste.basePath + "/"))) {
+        reject
+      } else {
+        extractActorSystem { system =>
+          val blockingIo =
+            system.dispatchers.lookup("pekko.actor.default-blocking-io-dispatcher")
+          val path = uri.path.toString
+          val pathAndQuery = uri.rawQueryString match {
+            case Some(query) => s"$path?$query"
+            case None        => path
+          }
+          complete(
+            Future(paste.combo(pathAndQuery))(blockingIo)
+              .map(toResponse)(ExecutionContext.parasitic)
+          )
+        }
+      }
     }
   }
 
-  /**
-   * Unversioned single-module path: /paste/{module}.{js|css}. Development
-   * convenience for fetching one module without a combo timestamp.
-   */
-  private def standaloneModuleRoute: Route =
-    path(Remaining) { moduleWithExt =>
-      if (moduleWithExt.isEmpty || moduleWithExt.contains("/")) reject
-      else serveModules(moduleWithExt, cacheable = false)
+  private def toResponse(response: ComboResponse): HttpResponse = {
+    val contentType = ContentType
+      .parse(response.contentType)
+      .getOrElse(ContentTypes.`text/plain(UTF-8)`)
+    val entity = contentType match {
+      case nonBinary: ContentType.NonBinary =>
+        HttpEntity(nonBinary, response.body)
+      case other =>
+        HttpEntity(other, org.apache.pekko.util.ByteString(response.body))
     }
-
-  /** Versioned combo path: /paste/{timestamp}/{modules}.{min.}{js|css}. */
-  private def versionedComboRoute: Route =
-    path(Segment / Remaining) { (_, modulesWithExt) =>
-      serveModules(modulesWithExt, cacheable = true)
-    }
-
-  val route: Route = pathPrefix("paste") {
-    standaloneModuleRoute ~ versionedComboRoute
+    HttpResponse(
+      status = StatusCodes
+        .getForKey(response.status)
+        .getOrElse(StatusCodes.InternalServerError),
+      headers = RawHeader("Cache-Control", response.cacheControl) ::
+        response.location.map(target => Location(Uri(target))).toList,
+      entity = entity
+    )
   }
-}
-
-object PasteComboRoute {
-  private lazy val defaultRoute = new PasteComboRoute()
-  
-  /**
-   * Default route using environment variables for paths.
-   */
-  def route: Route = defaultRoute.route
-  
-  /**
-   * Create route with manifest for module lookup (preferred).
-   */
-  def withManifest(manifest: Manifest, outputBasePath: String = "target/public", webjarBasePath: String = "target/paste-assetgraph-webjars"): PasteComboRoute = 
-    new PasteComboRoute(manifest = Some(manifest), outputBasePath = outputBasePath, webjarBasePath = webjarBasePath)
-  
-  /**
-   * Create route with custom paths.
-   */
-  def apply(pastePath: String, pasteElementsPath: String): PasteComboRoute = 
-    new PasteComboRoute(pastePath, pasteElementsPath)
-  
-  /**
-   * Create route with custom paths and webjar base path.
-   */
-  def apply(pastePath: String, pasteElementsPath: String, webjarBasePath: String): PasteComboRoute = 
-    new PasteComboRoute(pastePath, pasteElementsPath, webjarBasePath = webjarBasePath)
-  
-  /**
-   * Create route with manifest and fallback paths.
-   */
-  def apply(manifest: Manifest, pastePath: String, pasteElementsPath: String): PasteComboRoute = 
-    new PasteComboRoute(pastePath, pasteElementsPath, manifest = Some(manifest))
-  
-  /**
-   * Create route with manifest, fallback paths, output path, and webjar path.
-   * Note: For custom webjarBasePath only, use the 3-arg version with named parameters.
-   */
-  def apply(manifest: Manifest, pastePath: String, pasteElementsPath: String, outputBasePath: String, webjarBasePath: String = "target/paste-assetgraph-webjars"): PasteComboRoute = 
-    new PasteComboRoute(pastePath, pasteElementsPath, manifest = Some(manifest), outputBasePath = outputBasePath, webjarBasePath = webjarBasePath)
 }

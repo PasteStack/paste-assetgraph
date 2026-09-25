@@ -1,0 +1,20 @@
+[package]
+name = "paste-assetgraph-ffi"
+# The library ships inside the runtime packages, which carry the release
+# version — this crate is never published on its own.
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.83"
+
+[lib]
+name = "paste_assetgraph_ffi"
+crate-type = ["cdylib"]
+
+[dependencies]
+paste-assetgraph = { path = ".." }
+serde_json = "1.0"
+anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3.9"

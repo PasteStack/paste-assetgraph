@@ -87,6 +87,20 @@ final class BinarySpec extends AnyFunSuite with BeforeAndAfterEach {
     assert(Files.getLastModifiedTime(first) == marker, "a matching binary should not be written again")
   }
 
+  test("an empty directory at the extraction path is replaced by the binary") {
+    val target = Files.createTempDirectory("paste-assetgraph-binary-spec")
+    System.setProperty("paste.assetgraph.version", "0.1.0-develop-a1b2c3d")
+    val binaryTarget = expectedBinary(target, "0.1.0-develop-a1b2c3d")
+    Files.createDirectories(binaryTarget)
+
+    val extracted = Binary.extractBundled(target)
+
+    assert(extracted.contains(binaryTarget))
+    assert(Files.isRegularFile(binaryTarget))
+    assert(Files.isExecutable(binaryTarget))
+    assert(Files.size(binaryTarget) > 0)
+  }
+
   test("a modified extracted binary is replaced rather than reused") {
     val target = Files.createTempDirectory("paste-assetgraph-binary-spec")
     System.setProperty("paste.assetgraph.version", "0.1.0-develop-a1b2c3d")
@@ -98,6 +112,47 @@ final class BinarySpec extends AnyFunSuite with BeforeAndAfterEach {
 
     assert(second.contains(first))
     assert(Files.readAllBytes(first).toSeq == bundled.toSeq, "the bundled bytes should be restored")
+  }
+
+  test("an executable PASTE_ASSETGRAPH_BIN override wins") {
+    val binary = Files.createTempFile("paste-assetgraph-override", ".bin")
+    binary.toFile.setExecutable(true)
+
+    assert(Binary.envOverride(_ => Some(binary.toString)).contains(binary))
+  }
+
+  test("a set-but-invalid PASTE_ASSETGRAPH_BIN fails loudly instead of falling through") {
+    val missing = "/nonexistent/paste-assetgraph"
+    val missingError = intercept[IllegalStateException] {
+      Binary.envOverride(_ => Some(missing))
+    }
+    assert(missingError.getMessage.contains(missing))
+
+    // A file that exists but is not executable fails the same way.
+    val plain = Files.createTempFile("paste-assetgraph-plain", ".bin")
+    val plainError = intercept[IllegalStateException] {
+      Binary.envOverride(_ => Some(plain.toString))
+    }
+    assert(plainError.getMessage.contains(plain.toString))
+  }
+
+  test("an unset PASTE_ASSETGRAPH_BIN leaves resolution to the bundled binary") {
+    assert(Binary.envOverride(_ => None).isEmpty)
+  }
+
+  test("PATH lookup skips a directory and finds the executable file") {
+    val dirA = Files.createTempDirectory("paste-path-a")
+    Files.createDirectory(dirA.resolve(Binary.BinaryName))
+    val dirB = Files.createTempDirectory("paste-path-b")
+    val bin = Files.write(
+      dirB.resolve(Binary.BinaryName),
+      "#!/bin/sh\nexit 0\n".getBytes("UTF-8")
+    )
+    bin.toFile.setExecutable(true)
+
+    assert(
+      Binary.findInPath(_ => Some(s"$dirA${java.io.File.pathSeparator}$dirB")).contains(bin)
+    )
   }
 
   test("no bundled binary for the platform leaves resolution to the caller") {

@@ -3,6 +3,14 @@
 # with --locked so the published binary is built from reviewed dependencies.
 target/
 
+# Node and Python wrapper build and test artifacts
+node_modules/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
 # IDE
 .idea/
 *.iml
@@ -22,6 +30,15 @@ endpoint.config
 # for every configured target, never committed). The plugin's test fixtures
 # under src/test/resources/native/ are committed and unaffected.
 runtime/scala/sbt-plugin/src/main/resources/native/
+
+# The shared libraries the language runtimes load in-process: CI's build-rust
+# job produces them here, and each package's build copies them in.
+runtime/native/
+runtime/node/native-lib/
+runtime/python/src/paste_assetgraph/native-lib/
+
+# Generated into an sdist by setup.py; never committed to the source tree.
+runtime/python/BUILD_VERSION
 
 # Output of the determinism fixture build
 features/dist/

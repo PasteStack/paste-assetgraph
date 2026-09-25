@@ -1,48 +1,66 @@
 # Using paste-assetgraph with Scala/Pekko HTTP
 
-The Scala runtime reads the manifest and serves assets natively from Pekko HTTP.
+The Scala runtime is a thin loader: all tag, URL and combo logic lives in the
+`paste-assetgraph` Rust library. `Paste` loads it through JNA and calls
+`paste_render` and `paste_combo` in-process, and `PasteComboRoute` serves the
+combo responses from Pekko HTTP.
 
 ## Installation
 
 ```scala
-// build.sbt
+// build.sbt — select a published build that contains the Paste/PastePage API
 libraryDependencies ++= Seq(
-  "com.pastestack" %% "paste-assetgraph-runtime" % "0.1.0",
-  "com.pastestack" %% "paste-assetgraph-pekko" % "0.1.0"
+  "com.pastestack" %% "paste-assetgraph-runtime" % "<native-runtime-version>",
+  "com.pastestack" %% "paste-assetgraph-pekko" % "<native-runtime-version>"
 )
 ```
 
-The Rust binary is downloaded automatically on first use.
+The runtime jar bundles the shared libraries; resolution order is
+`PASTE_ASSETGRAPH_LIB` → bundled `native-lib/{platform}` library
+(checksum-verified on extraction).
 
 ## Quick Start
 
 ```scala
+import java.nio.file.Paths
+import scala.concurrent.Future
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.server.Directives._
-import com.pastestack.assetgraph.Manifest
+import org.apache.pekko.http.scaladsl.server.Directives.*
+import com.pastestack.assetgraph.Paste
 import com.pastestack.assetgraph.pekko.PasteComboRoute
 
-object Main extends App {
-  implicit val system: ActorSystem = ActorSystem()
-  implicit val ec = system.dispatcher
-  
-  // Load manifest (built by paste-assetgraph)
-  val manifest = Manifest.load("src/main/public/manifest.json")
-  val comboRoute = PasteComboRoute.withManifest(manifest, "src/main/public")
-  
+@main def run(): Unit = {
+  given system: ActorSystem = ActorSystem()
+  // Page dumps call the native library synchronously: render off the
+  // default dispatcher, as PasteComboRoute does for combo.
+  val blockingIo = system.dispatchers.lookup("pekko.actor.default-blocking-io-dispatcher")
+
+  // Manifest + compiled output built by paste-assetgraph
+  val paste = Paste(Paste.Settings(
+    manifest   = Paths.get("src/main/public/manifest.json"),
+    outputBase = Paths.get("src/main/public")
+  ))
+
   val routes = concat(
-    comboRoute.route,  // JAM endpoint with Cache-Control
+    new PasteComboRoute(paste).route,  // JAM endpoint under paste.basePath
     path("") {
       get {
-        complete(views.html.home(manifest))
+        onSuccess(Future(views.html.home(paste))(blockingIo)) { page =>
+          complete(page)
+        }
       }
     }
   )
-  
+
   Http().newServerAt("0.0.0.0", 8080).bind(routes)
 }
 ```
+
+If the manifest is on the classpath — e.g. produced by the sbt plugin's
+resource generator — use `Paste.fromClasspath()` instead (it copies the
+resource to a temp file once, defaulting `outputBase` to
+`Paste.defaultOutputBasePath`).
 
 ## Project Structure
 
@@ -72,8 +90,9 @@ my-app/
 ```hocon
 debug-mode = false
 
-source.js = "src/main/assets/js"
-source.scss = "src/main/assets/scss"
+# Each root is walked recursively and classified by extension; one dir may
+# hold .js, .scss and .css together.
+source.dirs = ["src/main/assets/js", "src/main/assets/scss"]
 source.images = "src/main/assets/images"
 
 output.base = "src/main/public"
@@ -88,47 +107,76 @@ source-maps = true
 
 jam.enabled = true
 jam.base-path = "/paste"
+jam.inline-threshold = 1024
+jam.hash-urls = true    # qualify versioned URL tokens with content hashes (default)
 ```
 
 ## Twirl Templates
 
+`PastePage` keeps the page's ordered jam/dump events; each dump re-renders the
+full list through the library so delivered modules stay out of later URLs. One
+page per render — not thread-safe. Each dump calls the library synchronously,
+so render templates on a blocking dispatcher, never the default one.
+
 `views/home.scala.html`:
 ```scala
-@(manifest: com.pastestack.assetgraph.Manifest)
+@(paste: com.pastestack.assetgraph.Paste)
 
+@defining(paste.page()) { page =>
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>My App</title>
-  
-  @* Versioned CSS via JAM *@
-  <link rel="stylesheet" href="@manifest.jamUrlForCss(Seq("site.theme"))">
+
+  @page.jam(css = Seq("site.theme"), js = Seq("paste.dom", "paste.ui.heroscroll"))
+  @Html(page.dumpCss())
 </head>
 <body>
   <h1>Hello World</h1>
-  
-  @* JAM: bundled JS modules with dependencies *@
-  <script src="@manifest.jamUrlForJs(Seq("paste.dom", "paste.ui.heroscroll"))" defer></script>
+
+  @Html(page.dumpJs())
 </body>
 </html>
+}
 ```
+
+`page.jam` records intent and returns `""`; the dumps emit markup: the inlined
+runtime once, `<link>`/`<style>` for CSS, and `isLoading` loader tags or
+`<script src>` for JS. Groups under `inlineThreshold` (1024 bytes; `0` disables
+automatic inlining) inline automatically; `inline = true` forces it.
 
 ## Build Integration
 
-### Option 1: sbt task
+### Option 1: sbt plugin
 
 ```scala
+// project/plugins.sbt
+addSbtPlugin("com.pastestack" % "paste-assetgraph-sbt" % "0.1.0")
+
 // build.sbt
-val assetBuild = taskKey[Unit]("Build assets")
+enablePlugins(AssetGraphPlugin)
 
-assetBuild := {
-  import com.pastestack.assetgraph.Binary
-  Binary.build("src/main/resources/paste-surface.conf")
-}
+// Settings (defaults shown):
+//   pasteAssetGraphSourceDirs   := Seq("src/main/assets/scss", "src/main/assets/js")
+//   pasteAssetGraphOutputDir    := "target/public"
+//   pasteAssetGraphManifestPath := ""  // defaults to Compile/resourceManaged/paste-assetgraph-manifest.json
+//   pasteAssetGraphMinify       := true
+//   pasteAssetGraphSourceMaps   := true
+//   pasteAssetGraphDebug        := false
+//   pasteAssetGraphHashUrls     := true  // -h{hash} pins in versioned URLs
+//   pasteAssetGraphOutputLayout := "flat"           // or "beside-source"
+//   pasteAssetGraphBuildDirName := "_paste_build"   // beside-source output dir name
 
-Compile / compile := (Compile / compile).dependsOn(assetBuild).value
+// With "beside-source", compiled files land in a <build-dir-name> directory
+// beside each source file and every manifest output is project-relative —
+// the runtime's outputBase is then the project base directory, and
+// pasteAssetGraphOutputDir must sit inside it.
 ```
+
+The plugin's `pasteAssetGraphBuild` runs as a `Compile / resourceGenerators`
+task, so assets build before compile and the manifest lands on the classpath
+(`Paste.fromClasspath()` finds it).
 
 ### Option 2: Manual
 
@@ -154,70 +202,90 @@ sbt run
 
 ## API Reference
 
-### `Manifest.load(path: String): Manifest`
-
-Load manifest from JSON file.
-
-### `manifest.resolve(sourcePath: String, debug: Boolean = false): Option[String]`
-
-Resolve source path to versioned output path.
+### `Paste`
 
 ```scala
-manifest.resolve("css/main.css")
-// => Some("/css/main.def456.v1.min.css")
+final case class Settings(
+  manifest: Path,
+  outputBase: Path,
+  outputJs: Option[Path] = None,       // default: <outputBase>/js
+  outputCss: Option[Path] = None,      // default: <outputBase>/css
+  cdnBase: String = "",                // URL prefix for emitted tags
+  basePath: String = "/paste",         // combo URL prefix + route mount
+  inlineThreshold: Int = 1024          // automatic inline limit; 0 disables
+)
+
+Paste(settings: Settings): Paste
+Paste.fromClasspath(
+  resource: String = "/paste-assetgraph-manifest.json",
+  outputBase: Path = Paths.get(Paste.defaultOutputBasePath),
+  cdnBase: String = "",
+  basePath: String = "/paste",
+  inlineThreshold: Int = 1024
+): Paste
 ```
 
-### `manifest.jamUrl(modules: Seq[String], debug: Boolean = false): String`
+- `paste.page(): PastePage` — new per-render event list.
+- `paste.combo(pathAndQuery: String): ComboResponse`
+  — resolves a request path (`/paste/…` optionally plus `?query`) to `status`,
+  `contentType`, `cacheControl`, `cacheable`, `body`. It calls the library
+  synchronously — `PasteComboRoute` wraps it in a `Future` on pekko's
+  `default-blocking-io-dispatcher`.
+- `paste.basePath` — the mount prefix the route matches.
 
-Generate JAM URL for bundled modules.
+Both calls go straight to the shared library: the wrapper adds no cache of
+its own (the library keeps a bounded manifest cache that reloads when the
+manifest file changes) and implements no tag, URL, dependency, or combo
+logic. A library error throws `PasteException` carrying the library's
+message.
 
-```scala
-manifest.jamUrl(Seq("paste.dom", "paste.ui.heroscroll"))
-// => "/paste/2025.02.02/abc123/paste.dom,paste.ui.heroscroll.min.js"
-```
-
-### `manifest.getDependencies(module: String): Seq[String]`
-
-Get all dependencies for a module (recursive, topologically sorted).
-
-```scala
-manifest.getDependencies("paste.ui.heroscroll")
-// => Seq("paste.dom", "paste.event", "paste.ui.throttle", "paste.ui.heroscroll")
-```
-
-### `manifest.getVersion(key: String, version: Option[Int] = None): Option[String]`
-
-Get output path for specific version (for rollback).
+### `PastePage`
 
 ```scala
-manifest.getVersion("css/main.css", Some(5))
-// => Some("/css/main.abc123.v5.min.css")
+page.jam(css: Seq[String] = Nil, js: Seq[String] = Nil,
+         inline: Boolean = false, sync: Boolean = false,
+         media: Option[String] = None): String   // records the jam, returns ""
+page.dumpCss(): String
+page.dumpJs(): String
 ```
 
 ## PasteComboRoute
 
-### Factory Methods
-
 ```scala
-// With manifest (preferred)
-PasteComboRoute.withManifest(manifest: Manifest, outputBasePath: String)
-
-// With custom paths
-PasteComboRoute(pastePath: String, pasteElementsPath: String)
-
-// With manifest and custom paths
-PasteComboRoute(manifest: Manifest, pastePath: String, pasteElementsPath: String)
+new PasteComboRoute(paste).route: Route
 ```
 
-### `route: Route`
+Matches `GET` requests whose full request path starts with
+`paste.basePath + "/"` and completes `Future(paste.combo(path + optional "?"
++ rawQuery))(blockingIo)` — the library call runs on the
+`default-blocking-io-dispatcher`. Because the match looks at the full URI, the
+route composes under an enclosing `pathPrefix`: nest it inside
+`pathPrefix("app")` with `basePath = "/app/paste"`. Paths outside the base
+path are rejected.
 
-JAM endpoint: `/paste/{timestamp}/{modules}.min.js` or `/paste/{timestamp}/{modules}.min.css`
+The response passes through untouched:
 
-Responses include `Cache-Control: public, max-age=31536000` for immutable caching.
+| Request | Status | Cache-Control |
+|---|---|---|
+| `/paste/{ts}/{module+vN-h{hash}~...}.min.{js\|css}` — canonical: pinned entries carrying each version's content hash under the default `jam.hash-urls` policy, canonical order, `ts` = the group's stamp | 200 at each pinned version — current or a retained history version | `public, max-age=31536000` |
+| `/paste/{ts}/{module+vN~...}.min.{js\|css}` — non-canonical: a stale stamp, a non-numeric segment, an unsorted list, an unpinned name, or a legacy `+vN` token under a qualified manifest | 302 with `Location` = the canonical URL (query preserved) | `no-cache`, empty body |
+| Same form with `ts` newer than the group's stamp — a URL from a newer build | 404 | `no-cache`, body `/* modules not found */` |
+| `/paste/{packages-segment}/{module}.js` | 200 — the runtime loader's URL, current build's segment only | `public, max-age=31536000` |
+| `/paste/{modules}.{js\|css}` (unversioned) | 200 | `no-cache` |
+| `/paste/require/{modules}.{ext}` or `?require` | 200 | `no-cache` |
+| `?filter=a~b` on a canonical versioned form | 200 | `public, max-age=31536000` |
+| Any named module unresolvable or unreadable, a pinned version the manifest cannot serve, a `-h` hash that is not the resolved version's recorded hash, a malformed version or hash token, or an empty or invalid module name in the list | 404 | `no-cache`, body `/* modules not found */` — never a partial group |
+
+The `Location` value travels on the response object as `location`; the route
+writes it as the `Location` header on a 302.
 
 ## Debug Mode
 
-Set `PASTE_DEBUG=true` environment variable to:
-- Serve source files instead of minified
-- Include source maps
-- Disable long cache headers
+The combo route serves **compiled output only** — there is no on-the-fly SCSS
+compilation and no source serving. The `.js` (non-min) URL form resolves to the
+same compiled file as `.min.js`. To see edited files, rebuild:
+`paste-assetgraph watch` in a separate terminal recompiles on change, and the
+unversioned `/paste/{module}.{js|css}` path is served `no-cache` so a refresh
+picks up new output immediately (versioned responses are cached for a year).
+The `debug-mode` config key (or `pasteAssetGraphDebug` in sbt) controls the
+build's debug flag — unminified output — which is separate from serving.

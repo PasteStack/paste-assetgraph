@@ -13,14 +13,19 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
     try test(directory) finally IO.delete(directory.toFile)
   }
 
-  private def writeJar(path: Path, entry: String, content: String): Unit = {
+  private def writeJar(path: Path, entries: Seq[(String, String)]): Unit = {
     val output = new ZipOutputStream(Files.newOutputStream(path))
     try {
-      output.putNextEntry(new ZipEntry(s"META-INF/resources/webjars/$entry"))
-      output.write(content.getBytes(UTF_8))
-      output.closeEntry()
+      entries.foreach { case (entry, content) =>
+        output.putNextEntry(new ZipEntry(s"META-INF/resources/webjars/$entry"))
+        output.write(content.getBytes(UTF_8))
+        output.closeEntry()
+      }
     } finally output.close()
   }
+
+  private def writeJar(path: Path, entry: String, content: String): Unit =
+    writeJar(path, Seq(entry -> content))
 
   private def extract(jar: Path, root: Path): Seq[String] =
     AssetGraphPlugin.extractWebjars(Seq(Attributed.blank(jar.toFile)), root.toFile, Logger.Null)
@@ -57,6 +62,49 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
     }
   }
 
+  test("a mid-extraction failure aborts the build without marking the group") {
+    withDirectory { directory =>
+      val jarA = directory.resolve("a.jar")
+      val jarB = directory.resolve("b.jar")
+      val root = directory.resolve("extracted")
+      // x/y.js fails at extraction: its parent x lands as a file first.
+      writeJar(jarA, Seq(
+        "demo/1.0/a.js" -> "A",
+        "demo/1.0/x" -> "not-a-dir",
+        "demo/1.0/x/y.js" -> "B"
+      ))
+      writeJar(jarB, Seq("demo/1.0/b.js" -> "B"))
+
+      intercept[java.io.IOException] {
+        AssetGraphPlugin.extractWebjars(
+          Seq(jarA, jarB).map(j => Attributed.blank(j.toFile)), root.toFile, Logger.Null
+        )
+      }
+      // Partial output stays unmarked, so a later run re-extracts instead of
+      // trusting the incomplete directory.
+      assert(!Files.exists(root.resolve("demo/1.0/.extracted")))
+    }
+  }
+
+  test("a directory that cannot be extracted aborts the whole build") {
+    withDirectory { directory =>
+      val jar = directory.resolve("assets.jar")
+      val root = directory.resolve("extracted")
+      writeJar(jar, Seq(
+        "good/1.0/a.js" -> "G",
+        "bad/1.0/x" -> "not-a-dir",
+        "bad/1.0/x/y.js" -> "B"
+      ))
+
+      intercept[java.io.IOException](extract(jar, root))
+
+      // Earlier groups still completed; the failing one is unmarked.
+      assert(new String(Files.readAllBytes(root.resolve("good/1.0/a.js")), UTF_8) == "G")
+      assert(Files.exists(root.resolve("good/1.0/.extracted")))
+      assert(!Files.exists(root.resolve("bad/1.0/.extracted")))
+    }
+  }
+
   test("rejects file traversal before overwriting a file outside the extraction root") {
     withDirectory { directory =>
       val jar = directory.resolve("assets.jar")
@@ -87,7 +135,9 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
     "../outside/file", "demo/../file", "demo/1.0/../../../file",
     "demo/1.0/..\\..\\file", "/demo/1.0/file", "C:/1.0/file",
     "demo/1.0/C:\\file", "demo//file", "demo/1.0/", "demo/1.0/.",
-    "demo/1.0/file:stream", "demo/1.0/line\nbreak"
+    "demo/1.0/file:stream", "demo/1.0/line\nbreak",
+    // reserved group-root marker name — a jar must never write it
+    "demo/1.0/.extracted"
   ).zipWithIndex.foreach { case (entry, index) =>
     test(s"rejects unsafe archive path $index") {
       withDirectory { directory =>
@@ -111,6 +161,250 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
       intercept[IllegalArgumentException](extract(jar, root))
       assert(new String(Files.readAllBytes(sentinel), UTF_8) == "preserve")
       assert(!Files.exists(outside.resolve("payload.txt")))
+    }
+  }
+
+  test("a same-size archive with new content refreshes even at an older mtime") {
+    withDirectory { directory =>
+      val jar = directory.resolve("assets.jar")
+      val root = directory.resolve("extracted")
+      writeJar(jar, "demo/1.0/css/main.css", "AAAA")
+      extract(jar, root)
+      val asset = root.resolve("demo/1.0/css/main.css")
+      assert(new String(Files.readAllBytes(asset), UTF_8) == "AAAA")
+      // Same length, different bytes, older mtime — an mtime cache would
+      // keep the stale content; the checksum comparison cannot.
+      writeJar(jar, "demo/1.0/css/main.css", "BBBB")
+      Files.setLastModifiedTime(jar, FileTime.fromMillis(0L))
+      extract(jar, root)
+      assert(new String(Files.readAllBytes(asset), UTF_8) == "BBBB")
+    }
+  }
+
+  test("a file deleted from an otherwise marked directory is restored") {
+    withDirectory { directory =>
+      val jar = directory.resolve("assets.jar")
+      val root = directory.resolve("extracted")
+      writeJar(jar, Seq("demo/1.0/a.js" -> "A", "demo/1.0/b.js" -> "B"))
+      extract(jar, root)
+      Files.delete(root.resolve("demo/1.0/a.js"))
+      extract(jar, root)
+      assert(new String(Files.readAllBytes(root.resolve("demo/1.0/a.js")), UTF_8) == "A")
+      assert(new String(Files.readAllBytes(root.resolve("demo/1.0/b.js")), UTF_8) == "B")
+    }
+  }
+
+  test("two jars contributing one root keep both sets, first jar wins a shared path") {
+    withDirectory { directory =>
+      val jarA = directory.resolve("a.jar")
+      val jarB = directory.resolve("b.jar")
+      val root = directory.resolve("extracted")
+      writeJar(jarA, Seq("demo/1.0/shared.js" -> "A", "demo/1.0/a.js" -> "A"))
+      writeJar(jarB, Seq("demo/1.0/shared.js" -> "B", "demo/1.0/b.js" -> "B"))
+
+      val paths = AssetGraphPlugin.extractWebjars(
+        Seq(jarA, jarB).map(j => Attributed.blank(j.toFile)), root.toFile, Logger.Null
+      )
+      assert(paths == Seq(root.resolve("demo/1.0").toFile.getCanonicalPath))
+      assert(new String(Files.readAllBytes(root.resolve("demo/1.0/a.js")), UTF_8) == "A")
+      assert(new String(Files.readAllBytes(root.resolve("demo/1.0/b.js")), UTF_8) == "B")
+      // Classpath order decides the shared member's content.
+      assert(new String(Files.readAllBytes(root.resolve("demo/1.0/shared.js")), UTF_8) == "A")
+
+      // A second pass sees the merged group as fresh, jarB's losing member
+      // does not make it stale.
+      assert(AssetGraphPlugin.extractWebjars(
+        Seq(jarA, jarB).map(j => Attributed.blank(j.toFile)), root.toFile, Logger.Null
+      ) == paths)
+    }
+  }
+
+  test("returned roots follow classpath order") {
+    withDirectory { directory =>
+      val jarAlpha = directory.resolve("alpha.jar")
+      val jarBeta = directory.resolve("beta.jar")
+      val root = directory.resolve("extracted")
+      writeJar(jarAlpha, "alpha/1.0/a.js", "A")
+      writeJar(jarBeta, "beta/1.0/b.js", "B")
+      val paths = AssetGraphPlugin.extractWebjars(
+        Seq(jarBeta, jarAlpha).map(j => Attributed.blank(j.toFile)), root.toFile, Logger.Null
+      )
+      assert(paths == Seq(
+        root.resolve("beta/1.0").toFile.getCanonicalPath,
+        root.resolve("alpha/1.0").toFile.getCanonicalPath
+      ), paths)
+    }
+  }
+
+  test("materializeManifest copies a configured external manifest to the managed name") {
+    withDirectory { directory =>
+      val base = directory.toFile
+      val managed = new java.io.File(base, "target/resource_managed")
+      val source = new java.io.File(base, "conf/history.json")
+      IO.createDirectory(source.getParentFile)
+      IO.write(source, "{\"a\":1}")
+      val target = AssetGraphPlugin.materializeManifest(base, managed, "conf/history.json")
+      assert(target == new java.io.File(managed, "paste-assetgraph-manifest.json"))
+      assert(new String(Files.readAllBytes(target.toPath), UTF_8) == "{\"a\":1}")
+      // The configured source stays on disk for CI inspection.
+      assert(source.isFile)
+    }
+  }
+
+  test("materializeManifest overwrites a stale managed default with the configured source") {
+    withDirectory { directory =>
+      val base = directory.toFile
+      val managed = new java.io.File(base, "target/resource_managed")
+      IO.createDirectory(managed)
+      val stale = new java.io.File(managed, "paste-assetgraph-manifest.json")
+      IO.write(stale, "stale")
+      val source = new java.io.File(base, "conf/history.json")
+      IO.createDirectory(source.getParentFile)
+      IO.write(source, "{\"a\":2}")
+      val target = AssetGraphPlugin.materializeManifest(base, managed, "conf/history.json")
+      assert(new String(Files.readAllBytes(target.toPath), UTF_8) == "{\"a\":2}")
+    }
+  }
+
+  test("materializeManifest with no configured path uses the managed file in place") {
+    withDirectory { directory =>
+      val base = directory.toFile
+      val managed = new java.io.File(base, "target/resource_managed")
+      IO.createDirectory(managed)
+      val existing = new java.io.File(managed, "paste-assetgraph-manifest.json")
+      IO.write(existing, "{\"a\":3}")
+      val target = AssetGraphPlugin.materializeManifest(base, managed, "")
+      assert(target.getCanonicalFile == existing.getCanonicalFile)
+      assert(new String(Files.readAllBytes(target.toPath), UTF_8) == "{\"a\":3}")
+    }
+  }
+
+  test("materializeManifest fails when the manifest was never generated") {
+    withDirectory { directory =>
+      val base = directory.toFile
+      val managed = new java.io.File(base, "target/resource_managed")
+      intercept[IllegalArgumentException] {
+        AssetGraphPlugin.materializeManifest(base, managed, "conf/missing.json")
+      }
+      intercept[IllegalArgumentException] {
+        AssetGraphPlugin.materializeManifest(base, managed, "")
+      }
+    }
+  }
+
+  test("generated config lists every source dir and the layout keys") {
+    val config = AssetGraphPlugin.generateConfig(
+      Seq("src/main/web", "lib/assets"),
+      "target/public",
+      "target/paste-assetgraph-manifest.json",
+      Seq.empty,
+      minify = true,
+      sourceMaps = true,
+      debugMode = false,
+      storageBackend = "local",
+      keepVersions = 10,
+      outputLayout = "flat",
+      buildDirName = "_paste_build"
+    )
+
+    // Every entry lands verbatim and in order — a dir that holds JS and
+    // styles together is a source root like any other.
+    assert(config.contains("""source.dirs = ["src/main/web", "lib/assets"]"""))
+    assert(config.contains("""output.layout = "flat""""))
+    assert(config.contains("""output.build-dir-name = "_paste_build""""))
+    assert(!config.contains("source.js"), config)
+    assert(!config.contains("source.scss"), config)
+    // Hash-qualified URLs default on; the setting feeds the generated file.
+    assert(config.contains("jam.hash-urls = true"), config)
+  }
+
+  test("generated config carries the hash-urls opt-out when set") {
+    val config = AssetGraphPlugin.generateConfig(
+      Seq("src/main/web"),
+      "target/public",
+      "target/paste-assetgraph-manifest.json",
+      Seq.empty,
+      minify = true,
+      sourceMaps = true,
+      debugMode = false,
+      storageBackend = "local",
+      keepVersions = 10,
+      outputLayout = "flat",
+      buildDirName = "_paste_build",
+      hashUrls = false
+    )
+    assert(config.contains("jam.hash-urls = false"), config)
+  }
+
+  test("writeGeneratedConfig feeds hash-urls through the shared config path") {
+    withDirectory { directory =>
+      val base = directory.toFile
+      val configFile = new java.io.File(base, "target/paste-assetgraph-generated.conf")
+      val resourceManaged = new java.io.File(base, "target/resource_managed")
+
+      // Both pasteAssetGraphBuild and pasteAssetGraphWatch generate through
+      // writeGeneratedConfig, so one check covers the setting on both.
+      AssetGraphPlugin.writeGeneratedConfig(
+        Logger.Null,
+        base,
+        configFile,
+        resourceManaged,
+        "",
+        Seq("src/main/web"),
+        "target/public",
+        Seq.empty,
+        minify = true,
+        sourceMaps = true,
+        debug = false,
+        storageBackend = "local",
+        keepVersions = 10,
+        "flat",
+        "_paste_build",
+        Seq.empty,
+        hashUrls = false
+      )
+
+      val generated = new String(Files.readAllBytes(configFile.toPath), UTF_8)
+      assert(generated.contains("jam.hash-urls = false"), generated)
+    }
+  }
+
+  test("writeGeneratedConfig overwrites a stale config with changed settings") {
+    withDirectory { directory =>
+      val base = directory.toFile
+      val configFile = new java.io.File(base, "target/paste-assetgraph-generated.conf")
+      val resourceManaged = new java.io.File(base, "target/resource_managed")
+
+      def write(sourceDirs: Seq[String], outputLayout: String): Unit =
+        AssetGraphPlugin.writeGeneratedConfig(
+          Logger.Null,
+          base,
+          configFile,
+          resourceManaged,
+          "",
+          sourceDirs,
+          "target/public",
+          Seq.empty,
+          minify = true,
+          sourceMaps = true,
+          debug = false,
+          storageBackend = "local",
+          keepVersions = 10,
+          outputLayout,
+          "_paste_build",
+          Seq.empty
+        )
+
+      // Watch used to generate only when the file was missing — a second run
+      // must pick up the changed settings, not the first config's contents.
+      write(Seq("stale/dir"), "flat")
+      write(Seq("src/main/web", "lib/assets"), "beside-source")
+
+      val regenerated = new String(Files.readAllBytes(configFile.toPath), UTF_8)
+      assert(regenerated.contains("""source.dirs = ["src/main/web", "lib/assets"]"""), regenerated)
+      assert(regenerated.contains("""output.layout = "beside-source""""), regenerated)
+      assert(!regenerated.contains("stale/dir"), regenerated)
+      assert(regenerated.contains("""manifest = "target/resource_managed/paste-assetgraph-manifest.json""""), regenerated)
     }
   }
 

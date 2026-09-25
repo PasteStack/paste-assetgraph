@@ -1,10 +1,13 @@
 package com.pastestack.assetgraph
 
-import java.io.InputStream
+import java.io.{InputStream, OutputStream}
 import java.nio.file.{Files, Path, Paths, StandardCopyOption}
-import java.security.MessageDigest
+import java.security.{DigestInputStream, MessageDigest}
+import java.util.Locale
 import scala.sys.process._
-import scala.util.Try
+import scala.util.{Try, Using}
+import sjsonnew.shaded.scalajson.ast.unsafe.{JField, JObject, JString}
+import sjsonnew.support.scalajson.unsafe.Parser
 
 /**
  * Resolves the platform-specific paste-assetgraph binary bundled in the sbt plugin.
@@ -21,9 +24,9 @@ object Binary {
   private val ExtractionDirectory = s"$BinaryName-bin"
 
   def path(targetDir: Path): Path =
-    envOverride()
+    envOverride(sys.env.get)
       .orElse(extractBundled(targetDir))
-      .orElse(findInPath())
+      .orElse(findInPath(sys.env.get))
       .getOrElse {
         throw new RuntimeException(
           s"""paste-assetgraph binary not found for $platformName.
@@ -47,10 +50,22 @@ object Binary {
   private def cwdFlag(cwd: Option[String]): Seq[String] =
     cwd.toSeq.flatMap(directory => Seq("--cwd", directory))
 
-  private def envOverride(): Option[Path] =
-    Option(System.getenv("PASTE_ASSETGRAPH_BIN"))
-      .map(Paths.get(_))
-      .filter(Files.isExecutable)
+  /**
+   * An explicit PASTE_ASSETGRAPH_BIN override wins over everything else — so a
+   * value that is set but does not name an executable file fails loudly instead
+   * of silently falling through to the bundled binary.
+   */
+  private[assetgraph] def envOverride(env: String => Option[String]): Option[Path] = {
+    val configured = env("PASTE_ASSETGRAPH_BIN").map(Paths.get(_))
+    configured.foreach { candidate =>
+      if (!isExecutableFile(candidate)) {
+        throw new IllegalStateException(
+          s"PASTE_ASSETGRAPH_BIN is set to $candidate but that is not an executable file"
+        )
+      }
+    }
+    configured
+  }
 
   /**
    * Extract this plugin version's bundled binary into `targetDir` and verify it
@@ -70,11 +85,11 @@ object Binary {
       .resolve(artifactVersion)
       .resolve(binaryFileName)
 
-    if (Files.isExecutable(binaryTarget) && expected.contains(sha256(binaryTarget))) {
+    if (isExecutableFile(binaryTarget) && expected.contains(sha256(binaryTarget))) {
       Some(binaryTarget)
     } else {
       Option(getClass.getResourceAsStream(s"/native/$platform/$binaryFileName")).map { input =>
-        val extracted = try extract(input, binaryTarget) finally input.close()
+        val extracted = Using.resource(input)(extract(_, binaryTarget))
         verifyChecksum(extracted, expected, platform)
       }
     }
@@ -100,9 +115,11 @@ object Binary {
   }
 
   private def checksumFor(content: String, platform: String): Option[String] =
-    ("\"" + java.util.regex.Pattern.quote(platform) + "\"\\s*:\\s*\"([0-9a-fA-F]{64})\"").r
-      .findFirstMatchIn(content)
-      .map(_.group(1).toLowerCase)
+    Parser.parseFromString(content).toOption
+      .collect { case obj: JObject => obj }
+      .flatMap(_.value.collectFirst { case JField(`platform`, JString(value)) => value })
+      .map(_.toLowerCase(Locale.ROOT))
+      .filter(_.matches("[0-9a-f]{64}"))
 
   private[assetgraph] def verifyChecksum(path: Path, expected: Option[String], platform: String): Path = {
     val actual = sha256(path)
@@ -115,26 +132,20 @@ object Binary {
 
   private def sha256(path: Path): String = {
     val digest = MessageDigest.getInstance("SHA-256")
-    val buffer = new Array[Byte](64 * 1024)
-    val input = Files.newInputStream(path)
-    try {
-      var read = input.read(buffer)
-      while (read != -1) {
-        digest.update(buffer, 0, read)
-        read = input.read(buffer)
-      }
-    } finally {
-      input.close()
+    Using.resource(new DigestInputStream(Files.newInputStream(path), digest)) { stream =>
+      stream.transferTo(OutputStream.nullOutputStream())
     }
-    digest.digest().map(byte => f"$byte%02x").mkString
+    digest.digest().map(byte => f"${byte & 0xff}%02x").mkString
   }
 
-  private def findInPath(): Option[Path] =
-    Option(System.getenv("PATH"))
-      .toSeq
+  private def isExecutableFile(path: Path): Boolean =
+    Files.isRegularFile(path) && Files.isExecutable(path)
+
+  private[assetgraph] def findInPath(env: String => Option[String]): Option[Path] =
+    env("PATH").toSeq
       .flatMap(_.split(java.io.File.pathSeparator).toSeq)
       .map(Paths.get(_).resolve(binaryFileName))
-      .find(Files.isExecutable)
+      .find(isExecutableFile)
 
   private def artifactVersion: String =
     Option(System.getProperty("paste.assetgraph.version"))
@@ -145,7 +156,7 @@ object Binary {
 
   private def resourceText(name: String): Option[String] =
     Option(getClass.getResourceAsStream(name)).flatMap { stream =>
-      try readResource(stream) finally stream.close()
+      Using.resource(stream)(readResource)
     }
 
   private[assetgraph] def platformName: String = osName match {
@@ -155,7 +166,7 @@ object Binary {
 
   private def osName: String =
     Option(System.getProperty("os.name"))
-      .map(_.toLowerCase)
+      .map(_.toLowerCase(Locale.ROOT))
       .collect {
         case os if os.contains("mac") || os.contains("darwin") => "darwin"
         case os if os.contains("linux") => "linux"
@@ -164,7 +175,7 @@ object Binary {
       .getOrElse("unknown")
 
   private def archName: String =
-    Option(System.getProperty("os.arch")).map(_.toLowerCase).collect {
+    Option(System.getProperty("os.arch")).map(_.toLowerCase(Locale.ROOT)).collect {
       case "aarch64" | "arm64" => "aarch64"
       case "amd64" | "x86_64" => "amd64"
       case other => other

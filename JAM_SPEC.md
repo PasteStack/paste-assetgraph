@@ -1,458 +1,304 @@
-# JAM (JavaScript Asset Manager) Specification
+# JAM (JavaScript Asset Management) Specification
 
 ## Overview
 
-JAM is the module loading system for PasteStack. It provides:
-- AMD-like module definition and dependency resolution
-- Combo URL loading for bundled modules
-- Inline bootstrap for paste.js module loader
+JAM is a system for managing JavaScript and CSS module dependencies in web applications. It generates optimized, cacheable URLs for module groups, serves their compiled output through a combo endpoint, and renders the markup that loads them.
 
-This spec defines the behavior that ALL runtime implementations must follow.
+**The Rust library owns all of it.** Tag generation, URL construction, dependency filtering and expansion, rendering, and combo responses are implemented once in `paste-assetgraph` and exposed through a small C ABI:
+
+- `paste_render(settings_json, events_json)` — renders a JSON event list and returns the dump HTML;
+- `paste_combo(settings_json, path_and_query)` — resolves a request path (optionally followed by `?query`) to a response (`status`, `contentType`, `cacheControl`, `cacheable`, `location`, `body`).
+
+Both return a JSON envelope — `{"ok": ...}` or `{"error": "<message>"}` — as a heap string the caller releases with `paste_free`. The same logic also backs the `render`/`combo` commands of the `paste-assetgraph` CLI. There is no server in the library: `combo` returns a response description — including a `location` for the canonical-URL redirects below — and the host framework writes the HTTP answer.
+
+Language runtimes (Scala, Node, Python) are thin loaders: they locate the shared library (`PASTE_ASSETGRAPH_LIB`, else the bundled copy), call it with a settings JSON, and surface the envelope. They implement no tag, URL, dependency, combo, or caching logic of their own. Static sites do not need a runtime at all — `build` renders the same markup into HTML templates at build time.
 
 ## URL Format
 
-### Combo URL Structure
+The canonical URL identifies the **exact filtered group** it serves:
 
 ```
-/paste/{timestamp}/{module+version,...}.{min.}js
+{cdn}{base_path}/{timestamp}/{module}+v{version}.0[-h{hash}][~{module}+v{version}.0[-h{hash}]...].min.{js|css}
 ```
 
-**Components:**
-- `/paste/` - Fixed prefix (configurable via `packagesUrl`)
-- `{timestamp}` - Unix timestamp of when the module group last changed
-- `{module+version,...}` - Comma-separated list of modules with versions
-- `.min.js` or `.js` - Minified vs debug suffix
+Examples (a real hash is the full 32-character lowercase MD5 hex):
 
-**Examples:**
 ```
-/paste/1387575212/paste.dom+v1.0,paste.event+v2.0.min.js
-/paste/1387575212/paste.ui.heroscroll+v3.0,paste.ui.stickynav+v1.0.min.js
+/paste/1770462000/paste.dom+v2.0-h0bdbb2c325525e986d55ef50ca66d056~paste.event+v1.0-h7e9e92b0857c477a6e8aebb0ab2bd924.min.js
+/paste/1770465409/site.theme+v1.0-h2c56c360580420d293172f42d85dfbed.min.css
 ```
 
-### CSS Combo URL
+- `timestamp` — the maximum last-modified stamp (Unix seconds) across the modules actually delivered by the URL, at the versions being rendered — after dependency expansion where requested and after render-time filtering. A build stamps a new version from the source file's mtime (clamped to `SOURCE_DATE_EPOCH` when set) and carries an unchanged asset's stamp forward, so the segment moves only when a member of the group actually changed.
+- `{module}+v{N}.0` — the module name plus its major version from the manifest. Every module a render names — jammed directly or reached as a dependency — must resolve to a manifest asset of the dump's type; an unknown module fails the render.
+- `-h{hash}` — the hash qualifier: the full 32-character content hash (MD5, lowercase hex) recorded for that exact version. **On by default** for new builds (`jam.hash-urls`); a build may opt out with `jam.hash-urls = false`, which keeps emitting and serving the legacy `+vN.0` shape. The build writes the policy into the manifest (`hash_urls`), so runtimes and adapters need no setting of their own — the URL a page carries is interpreted by the library alone. A manifest written before the field existed has no `hash_urls` key and stays on the legacy form until a build rewrites it. Any `-h` pin in a request is checked against the resolved version's recorded hash — case-insensitively, canonical URLs emit lowercase — and a mismatch is a 404, never a redirect onto different bytes. A correctly qualified URL resolves under an opted-out manifest too: one qualified pin in the request makes the canonical form qualified for every member, so a mixed list redirects to all-qualified tokens.
+- Module order is dependency order (dependencies first), not request order — for groups of current versions. A group containing a historical pin keeps the order the URL lists.
+- `~` separates modules in emitted URLs; `,` is accepted as a separator when a combo request is parsed, and both are accepted in `filter` lists.
+- `.min.js` and `.js` (likewise `.min.css`/`.css`) are both accepted. They serve the same compiled output — the suffix is part of the URL contract, not a serving-mode switch; whether output is minified is decided by the build (`--debug` build flag).
 
-Same format with `.css` extension:
+**Long lists.** A hash-qualified list can exceed a filesystem's component limit (255 bytes) when a static build materializes each URL as a file. A rendered URL therefore may continue the list over `/`-separated path components — each component carries complete `~`-joined tokens, the `.min.{ext}` suffix lands only on the last component, and the combo endpoint joins the components back into one ordered list. The component boundary is a separator, never part of a token: the canonical form is still the single-component URL, and a segmented canonical request serves 200 while a stale one redirects to the joined canonical form.
+
+### Request forms
+
+| Form | Behavior | Cache |
+|---|---|---|
+| `{base}/{ts}/{list}.{ext}` | Versioned, canonical: every entry pins `+vN` (plus `-h{hash}` under the qualified policy), the list is in canonical order, and `ts` equals the group's stamp — serves the listed group exactly as named | `public, max-age=31536000` |
+| `{base}/{ts}/{list}.{ext}` | Versioned, non-canonical: a stale stamp, a non-numeric segment, a list out of canonical order, or an unpinned name — the request resolves, but the URL is not the canonical one | `302` with `Location` = the canonical URL (query preserved), `no-cache`, empty body |
+| `{base}/{ts}/{list}.{ext}` | Versioned, from the future: `ts` is newer than the group's stamp — a URL from a newer build hitting an older deployment | `404`, `no-cache` |
+| `{base}/require/{list}.{ext}` | Expands the listed modules' transitive dependencies and serves the whole set, ordered | `no-cache` |
+| `{base}/{list}.{ext}?require` | Same expansion via the query flag | `no-cache` |
+| `{base}/{list}.{ext}?filter=a~b` | Drops the named modules from the ordered group before serving (they were already delivered on the page) | follows the versioned/unversioned rule — a versioned request canonicalizes before `filter` is consulted |
+| `{base}/{list}.{ext}` | Unversioned: serves the named group under a path that never changes | `no-cache` |
+
+The canonical list for an all-current group is the listed modules ordered by the manifest's dependency layering; once any pinned version is historical, the canonical list is the listed order itself. The canonical stamp is the maximum epoch seconds over the resolved versions' own timestamps — history entries carry theirs. A segment that is not all digits, a listed order that differs from canonical, or a stamp below canonical is a redirect; a stamp above is the not-found form.
+
+Query parsing is form decoding (`+` means space in query values; the `+` in the path's `name+vN.0` tags stays literal — the path segment is percent-decoded, not form-decoded). `filter` names that are not valid module names are ignored. `require` may appear with any value (`?require`, `?require=1`).
+
+Each `+vN` in a versioned list entry is served exactly: the module's current version when `N` matches it, or a version retained in the entry's `history` whose compiled file is still on disk (the `dist` storage backend keeps the current output plus the `storage.keep-versions` most recent historical versions; `local` keeps only the current one). A version the server cannot serve — newer than the manifest knows, or pruned from history — is a 404 with `no-cache`, never another version's content. A malformed version token — a bad major/minor, an overflowing version, or a malformed `-h` qualifier (empty, non-hex, or not exactly 32 hex characters) — or the same module listed at two different pins (different versions, or a hash on one spelling but not the other, or two different hashes) is a 404 too.
+
+A supplied `-h` hash is checked against the resolved version's recorded hash **before any redirect decision** — for every listed module, including one `?filter=` would later drop — so a wrong hash is always a `no-cache` 404. Under a hash-enabled manifest a legacy `+vN` request canonicalizes onto the qualified URL (302); under an opted-out manifest legacy URLs serve as before while qualified requests still resolve and validate.
+
+An entry whose source was deleted is marked `retired` in the manifest. It resolves through a `+vN` pin only — the current version included — and each resolution counts as historical for canonical ordering. Every unversioned form ignores retired entries entirely: the bare list, `require`, `filter`, the loader's packages-segment fetch, and render-time module expansion all see only the active set.
+
+Under the cacheable form every listed entry must pin a version — with one exception: the runtime loader fetches `{packagesUrl}{module}.js`, i.e. `{base}/{packages-segment}/{module}.js`. That unversioned URL is served and year-cached only for a js list under this manifest's own packages segment; any other unpinned entry under a versioned segment redirects to its canonical pinned URL like any non-canonical spelling. Under `require` and the unversioned single-segment form, unversioned entries resolve to the current version — those responses are `no-cache`.
+
+**Rolling deploys.** A page rendered by build N can reach a server already running build N+1. The page's `+vN` pins ask for exactly what was rendered, and the packages segment pins the loader fetch to the build that produced the page, so old-version requests keep working while the files are retained — and anything the server cannot serve exactly is a `no-cache` 404 rather than a year-cached wrong version. Serving whatever the current manifest holds under a versioned URL would let a CDN pin v3 content under a v2 URL.
+
+### Errors
+
+When any module in the resolved group has no manifest asset of the request's
+type or no readable compiled output at the version its entry pinned — an
+unknown name, an unresolvable dependency, a missing or pruned file, a
+version the manifest does not know, or an empty or invalid module name or
+version token in the list — the whole response is a not-found, never a
+partial group:
+
 ```
-/paste/1387575212/paste.base+v1.0,paste.ui.heroscroll+v1.0.min.css
+status: 404
+body: /* modules not found */
+Cache-Control: no-cache
 ```
+
+The same strictness applies at render time: a jam naming a module with no
+asset of the dump's type fails the `render` command (and therefore the
+build) rather than emitting a URL that cannot be served.
 
 ## Bootstrap HTML
 
-### Full Bootstrap (with inlined paste.js)
+`render` replays a JSON event list and prints the markup the last `dump` event produces. Input:
 
-```html
-<script type="text/javascript">
-{paste.js content inlined here}
-</script>
-<script type="text/javascript">
-(function(d,r){
-  d('paste.dom').isLoading=d('paste.event').isLoading=!0;
-  r('/paste/1387575212/paste.dom+v1.0,paste.event+v2.0.min.js');
-})(paste.define,paste.require);
-</script>
+```json
+{"events": [
+  {"jam": {"css": ["site.theme"], "js": ["paste.dom", "paste.event"]}},
+  {"dump": "css"},
+  {"dump": "js"}
+]}
 ```
 
-### Module Loading Bootstrap (paste.js already loaded)
+Output for the first `js` dump (the `paste` runtime module is inlined ahead of it, once):
 
 ```html
-<script type="text/javascript">
-(function(d,r){
-  d('paste.dom').isLoading=d('paste.event').isLoading=!0;
-  r('/paste/1387575212/paste.dom+v1.0,paste.event+v2.0.min.js');
-})(paste.define,paste.require);
-</script>
+<script type="text/javascript">…paste runtime source…
+;
+paste.config({packagesUrl:'/paste/71f8e72a3d6b/'});</script>
+<script type="text/javascript">(function(d,r){d('paste.dom').isLoading=d('paste.event').isLoading=!0;r('/paste/1770462000/paste.dom+v2.0~paste.event+v1.0.min.js');})(paste.define,paste.require);</script>
 ```
+
+- The runtime script is emitted once, before the first JS tag, and joins `paste.config({packagesUrl:'{cdn}{base}/{segment}/'})` onto the runtime source with the `\n;\n` separator so a runtime ending in a `//` comment cannot swallow the config. `segment` is the first 12 hex chars of MD5 over the manifest's sorted JS `key:hash` pairs — it changes whenever any JS content changes, so a deterministic build still gets fresh loader URLs. When the runtime source cannot be inlined (missing or unsafe content) it is emitted as an external `<script src>` plus a separate config script instead.
+- The async loader marks each pending module `isLoading` and `paste.require`s the exact-group URL.
+- `jam.sync = true` emits `<script type="text/javascript" src="{cdn}{base}/{ts}/{list}.min.js"></script>` instead.
+- CSS groups emit `<link rel="stylesheet" href="{cdn}{base}/{ts}/{list}.min.css"/>` — with `media="print"` when the jam event carries `media` — or an inline `<style type="text/css">…</style>` when the group is below the inline threshold.
+- Groups at or under `inline_threshold` UTF-8 bytes of compiled output (default `1024`, `0` disables automatic inlining) are inlined as `<script type="text/javascript">…</script>` / `<style>…</style>`; `jam.inline = true` forces inlining regardless of size. JS content containing `</script` or `<!--`, and CSS containing `</style`, is never inlined — the group falls back to the external tag.
+- A page jams `paste` itself as an ordinary module: the runtime emits `paste` inline first, so a later `paste.dom` group's URL names only `paste.dom` — `paste` is already delivered and stays out of the URL entirely (no exclusion query is needed).
 
 ## Behavior Requirements
 
-### 1. Timestamp Calculation
+### 1. Manifest Loading
 
-The timestamp MUST be the maximum timestamp of all modules in the group:
+- `render` and `combo` take `--manifest` and `--output-base` (plus optional `--output-js`, `--output-css`) and only read the files they need — the manifest JSON and the compiled assets under the output directories.
+- The manifest must validate: `version` and `generated` strings, `assets` map present, every asset `output` path resolving under the output directories. Invalid manifests fail the command; null bytes in strings are rejected.
+- Asset paths are safe: no `..`, no absolute paths, no escaping the output directories.
 
-```
-timestamp = max(module1.timestamp, module2.timestamp, ...)
-```
+### 2. Stamp Computation
 
-This ensures cache invalidation when ANY module in the combo changes.
+The URL's stamp segment is the maximum, in epoch seconds, of the members' `timestamp` values at the versions being rendered — over the **exact delivered group** after expansion and filtering, not just the requested modules. Every member must carry a parseable timestamp: a member without one is a render error naming the module and telling the operator to rebuild the manifest — there is no constant fallback, because a wrong stamp would mint an unchanging URL for changing content. The build stamps new versions from source mtime (clamped by `SOURCE_DATE_EPOCH`), carries unchanged entries forward, and backfills an empty or unparseable stamp on a carried-forward entry the same way.
 
-### 2. Module Version Format
+### 3. Module Ordering
 
-Module versions MUST be formatted as `{module}+v{version}.0`:
+Modules are served and named in dependency order: the render path expands each jam's module list to its transitive closure, removes modules already delivered on the page, orders the remainder by dependency, and names exactly those modules in the URL.
 
-```
-paste.dom+v1.0
-paste.ui.heroscroll+v3.0
-```
+### 4. Dependencies only when requested
 
-### 3. isLoading Pre-registration
+A versioned URL serves precisely the modules it names. Dependencies are added to a served group only when the request asks — `/require/{list}.{ext}` or `?require`.
 
-Before loading the combo URL, modules MUST be pre-registered as loading:
+### 5. isLoading
 
-```javascript
-paste.define('module.name').isLoading = true;
-```
+For each async JS group the loader emits `d('{module}').isLoading` for every pending module so `paste.define` callers can detect in-flight loads.
 
-This allows paste.js to defer activation until the script loads.
+### 6. Combo Serving
 
-### 4. Combo URL Serving
+`combo` resolves any of the request forms above to a single response. Each `+vN` pin resolves through the manifest: the entry's current output when `N` is the current version, else a retained `history` version's output, else the 404 form. For the versioned form the resolved group is checked against its canonical URL — canonical order (the layering for all-current groups, the listed order once a historical pin is present), the `+vN.0` spellings, and the canonical stamp — and a mismatch answers the 302 form with `location` set to the canonical URL plus the request's original query. A stamp above canonical is the 404 form. The group is read from compiled output under the output directories, joined with the `\n;\n` separator for JS and newline for CSS. Any member that cannot be resolved and read, and any empty or invalid module name or version token in the list, turns the whole response into the 404 form; a partial group is never served. Cache-Control is `public, max-age=31536000` for a successful versioned non-require response — `filter` does not change that — and `no-cache` for unversioned, require, redirect, and 404 responses.
 
-The server MUST:
-1. Parse the combo URL to extract module list
-2. Read each module's content from storage
-3. Concatenate all module contents
-4. Return with appropriate Content-Type (`application/javascript` or `text/css`)
-5. Set cache headers based on timestamp
+### 7. Inline Threshold
 
-### 5. Debug vs Production Mode
+Automatic inlining applies to groups whose joined compiled output is at most `inline_threshold` bytes (default `1024`; `0` disables it). `jam.inline` forces inlining regardless of threshold. Unsafe content never inlines (see Bootstrap HTML).
 
-**Production mode** (`.min.js`, `.min.css`):
-- Serve pre-compiled, minified content from manifest paths
-- CSS served from compiled output (SCSS already processed)
+### 8. Page Tracking via Event Replay
 
-**Debug mode** (`.js`, `.css` without `.min`):
-- Serve raw source files
-- SCSS compiled on-the-fly to CSS
-- No minification
-- May include source maps
+A page render is an ordered list of events: `{"jam":{...}}` records a group; `{"dump":"css"|"js"}` renders the markup for all events so far. Modules already emitted by earlier groups are excluded from later ones — state lives in the event list, so any wrapper renders identically by replaying the same events. Each dump re-renders the full list; the last dump's output is what `render` prints.
 
-The URL suffix determines the mode:
-```
-/paste/123/paste.dom+v1.0.min.js  → Production (minified)
-/paste/123/paste.dom+v1.0.js      → Debug (raw source)
-```
+### 9. Build-Time Templates
 
-### 6. SCSS Compilation
+`build` (and every `watch` rebuild) renders HTML templates when `templates.source` is configured: `<!-- paste:jam ... -->` and `<!-- paste:dump css|js -->` directives in `*.html` under the source directory produce the same markup as a runtime `render` call. Rendered pages land under `templates.output`; every referenced combo file and the per-module loader files are materialized under `output.base`. The build fails if `templates.output` equals or nests inside `templates.source`.
 
-For CSS modules:
-- **Build time**: SCSS files are compiled to CSS and minified
-- **Dev mode**: SCSS compiled on-the-fly when `.css` requested but only `.scss` exists
-- Compiled output path: `{checksum}.v{version}.min.css`
+### 10. Runtime Configuration
 
-## Module Declaration
-
-### @module Comment Format
-
-Modules declare their name explicitly using YUI-doc style comments:
-
-```javascript
-/**
- * Description of the module
- * @requires paste/dom
- * @requires paste/event
- * @module paste/ui/heroscroll
- */
-```
-
-**Comment format:**
-- `@module {namespace}/{name}` - The canonical module name (uses `/` separator)
-- `@requires {namespace}/{name}` - Dependencies (optional, for documentation)
-
-**Module name conversion:**
-- Comment: `@module paste/ui/heroscroll` 
-- Runtime: `paste.ui.heroscroll` (dots for JavaScript)
-- URL: `paste.ui.heroscroll+v1.0`
-
-### CSS Module Declaration
-
-SCSS/CSS files use the same format:
-
-```scss
-/**
- * Hero scroll component styles
- * @module paste/ui/heroscroll
- */
-```
-
-### Module Name Resolution Priority
-
-When resolving a module name to its asset:
-
-1. **Manifest lookup** (preferred) - the `modules` map names the module's key in
-   the `assets` map, for the requested asset type
-2. **Key convention** (fallback) - `{type}/{module with dots as slashes}.{type}`
-
-### Manifest Module Map
-
-The manifest MUST include a `modules` section mapping each declared name to the
-module's key in the `assets` map — never to a source path. A consumer resolves a
-module by looking that value up in `assets`, so a value that is not a key of
-`assets` is ignored in favour of the convention key:
-
-```json
-{
-  "modules": {
-    "paste.ui.heroscroll": "js/paste/ui/heroscroll.js",
-    "paste.ui.stickynav": "js/paste/ui/stickynav.js",
-    "site.home": "js/site/home.js",
-    "site.theme": "css/theme.css"
-  },
-  "assets": { ... }
-}
-```
-
-A declared name need not match the file layout: `site.theme` above is declared by
-`theme.scss`, whose asset key stays `css/theme.css`. That is precisely why the
-map exists. Each asset entry carries its own `source`, recorded relative to the
-project root.
-
-### Module Extraction
-
-Assetgraph MUST:
-1. Parse JS/SCSS files for `@module` comments
-2. Extract module name (converting `/` to `.`)
-3. Include in manifest's `modules` map
-4. Support files without `@module` (fallback to filename)
+The inlined runtime is configured per render: `paste.config({packagesUrl:'{cdn}{base}/{segment}/'})`, where `segment` is content-derived from the manifest's JS assets (see Bootstrap HTML). The runtime source is read from the compiled `paste` module; when it cannot be inlined the runtime loads externally and the config follows in its own script tag.
 
 ## Manifest Structure
 
-### Module Entry Properties
-
-Each module in the manifest MUST include:
-
 ```json
 {
-  "source_path": "src/js/home.js",
-  "source_checksum": "abc123...",
-  "name": "site.home",
-  "dependencies": ["paste.dom", "paste.event", "paste.util"],
-  "last_modified": 1387575212,
-  "checksum": "def456...",
-  "path": "js/site/home.def456.v1.min.js",
-  "byte_size": 1234,
-  "version": 1
-}
-```
-
-**Key property:** `dependencies` MUST contain ALL transitive dependencies, not just direct ones. This is computed during build via topological sort with backfill.
-
-### Dependency Expansion (Build Time)
-
-During manifest build, dependencies MUST be expanded:
-
-1. Parse `@requires` from each module
-2. Build dependency graph
-3. Topologically sort all modules
-4. **Backfill transitive dependencies** - each module gets ALL its transitive dependencies added
-
-```python
-# Original behavior from manifest.py
-def walk_tree(dep, dep_set=None):
-    for d in name_dep_dict[dep]:
-        dep_set.add(d)
-        dep_set |= walk_tree(d, dep_set)
-    return dep_set
-
-# Backfill
-for module_name in reversed(flat_top_sorted):
-    module.dependencies |= walk_tree(module_name)
-```
-
-### sorted_deps
-
-The manifest SHOULD include a `sorted_deps` section with pre-computed topological order:
-
-```json
-{
+  "version": "2026.02.07.1156",
+  "generated": "2026-02-07T11:56:49Z",
+  "modules": {
+    "paste": "js/paste.js",
+    "paste.dom": "js/paste/dom.js"
+  },
+  "assets": {
+    "js/paste.js": {
+      "source": "src/paste.js",
+      "output": "/js/paste.7e9e92b0857c477a6e8aebb0ab2bd924.v1.min.js",
+      "hash": "7e9e92b0857c477a6e8aebb0ab2bd924",
+      "version": 1,
+      "timestamp": "2026-02-06T10:00:00+00:00",
+      "dependencies": [],
+      "history": []
+    },
+    "js/paste/dom.js": {
+      "source": "src/dom.js",
+      "output": "/js/dom.0bdbb2c325525e986d55ef50ca66d056.v2.min.js",
+      "hash": "0bdbb2c325525e986d55ef50ca66d056",
+      "version": 2,
+      "timestamp": "2026-02-06T11:00:00+00:00",
+      "dependencies": ["paste"],
+      "history": []
+    }
+  },
   "sorted_deps": {
     "js": [
-      ["paste.util", "js/paste.util.abc.v1.min.js", 1],
-      ["paste.dom", "js/paste.dom.def.v1.min.js", 1],
-      ["paste.event", "js/paste.event.ghi.v2.min.js", 2],
-      ["site.home", "js/site/home.jkl.v1.min.js", 1]
-    ],
-    "css": [...]
-  }
+      ["paste", "/js/paste.7e9e92b0857c477a6e8aebb0ab2bd924.v1.min.js", 1],
+      ["paste.dom", "/js/dom.0bdbb2c325525e986d55ef50ca66d056.v2.min.js", 2]
+    ]
+  },
+  "hash_urls": true
 }
 ```
 
-This allows combo URL serving without runtime dependency resolution.
+- `modules` maps a module name to its asset key; a key whose entry is `retired` may remain here — resolution, not the map, filters it.
+- `assets[key].output` is the path under the output directory; `dependencies` are module names; `version` and `timestamp` feed the URL tags and timestamp.
+- `assets[key].retired` is `true` only on an entry whose source was deleted — the field is always written, and absent in an older manifest means active: its retained pins keep serving while nothing unpinned resolves it.
+- `sorted_deps` is a named-module index the build emits per type (`"js"`, `"css"`): topologically sorted `[module_name, output_path, version]` triples over active assets.
+- `generated_dirs` lists project-relative directories the build has generated into — how a layout or build-directory change relocates retained outputs without a filesystem search, and what discovery excludes so generated files never re-enter as sources.
+- `hash_urls` records the URL policy the build ran under (`jam.hash-urls`, default `true`): whether rendered versioned tokens carry the `-h{hash}` qualifier. Always written. Absent in a manifest built before the field existed means `false` — the manifest keeps serving and emitting legacy `+vN.0` URLs until a build rewrites it — while correctly qualified requests resolve and validate under either policy. The manifest carries the policy so adapters forward paths without reimplementing it.
 
-## Manifest Integration
+## Module Declaration
 
-### Reading paste.js for Inlining
+In JavaScript files:
 
-Runtime MUST support reading paste.js from:
-1. Filesystem path (absolute or relative)
-2. Classpath resource (path starting with `/`)
-
-```scala
-// Scala
-manifest.jamInlineBootstrap("/paste.js", modules)
-
-// Python
-manifest.jam_inline_bootstrap("/paste.js", modules)
+```javascript
+/**
+ * My module
+ * @requires paste/dom
+ * @module site/mymodule
+ */
 ```
 
-### Resolving Module Versions
+In SCSS files:
 
-For each module, lookup in manifest:
-
-```json
-{
-  "assets": {
-    "js/paste/dom.js": {
-      "version": 1,
-      "timestamp": "1387575212",
-      "output": "/js/paste.dom.abc123.v1.min.js"
-    }
-  }
-}
+```scss
+/**
+ * @requires site/theme
+ * @module site/mypage
+ */
 ```
-
-## BDD Scenarios
-
-### Feature: JAM URL Generation
-
-```gherkin
-Scenario: Generate combo URL for single module
-  Given a manifest with paste.dom at version 1 and timestamp 1387575212
-  When I request a JAM URL for ["paste.dom"]
-  Then the URL should be "/paste/1387575212/paste.dom+v1.0.min.js"
-
-Scenario: Generate combo URL for multiple modules
-  Given a manifest with:
-    | module         | version | timestamp  |
-    | paste.dom      | 1       | 1387575210 |
-    | paste.event    | 2       | 1387575212 |
-  When I request a JAM URL for ["paste.dom", "paste.event"]
-  Then the URL should be "/paste/1387575212/paste.dom+v1.0,paste.event+v2.0.min.js"
-  And the timestamp should be the maximum (1387575212)
-
-Scenario: Generate debug URL
-  Given a manifest with paste.dom at version 1
-  When I request a JAM URL for ["paste.dom"] with debug=true
-  Then the URL should end with ".js" not ".min.js"
-```
-
-### Feature: Bootstrap Generation
-
-```gherkin
-Scenario: Generate bootstrap with isLoading
-  Given modules ["paste.dom", "paste.event"]
-  When I generate a bootstrap
-  Then the script should contain "d('paste.dom').isLoading=d('paste.event').isLoading=!0"
-
-Scenario: Generate inline bootstrap with paste.js
-  Given paste.js content "/* paste.js code */"
-  And modules ["paste.dom"]
-  When I generate an inline bootstrap
-  Then the first script tag should contain the paste.js content
-  And the second script tag should load the combo URL
-```
-
-### Feature: Combo URL Serving
-
-```gherkin
-Scenario: Serve combo URL
-  Given modules paste.dom with content "/* dom */" and paste.event with content "/* event */"
-  When I request "/paste/1387575212/paste.dom+v1.0,paste.event+v1.0.min.js"
-  Then the response should contain "/* dom */" followed by "/* event */"
-  And the Content-Type should be "application/javascript"
-
-Scenario: Serve CSS combo URL
-  Given modules paste.base with content "body{}" and paste.ui with content ".ui{}"
-  When I request "/paste/1387575212/paste.base+v1.0,paste.ui+v1.0.min.css"
-  Then the response should contain "body{}" followed by ".ui{}"
-  And the Content-Type should be "text/css"
-```
-
-## Build System: Primer
-
-The Primer processes source files at build time:
-
-### JavascriptPrimer
-
-1. Parse `@module` and `@requires` from JS doc comments
-2. **Production mode**: Compress using Closure Compiler with `--compilation_level`
-3. **Compile mode** (dev): Store raw source, path points to source file
-4. Write compressed output to `{hash}.v{version}.min.js`
-
-### SCSSPrimer
-
-1. Parse `@module` and `@requires` from SCSS comments
-2. Strip module/require declarations from source before compilation
-3. **Production mode**: Compile SCSS to CSS using sass compiler with `--compress`
-4. **Compile mode** (dev): Store cleaned source, compile on-the-fly when read
-5. `read_primed()` in compile mode triggers SCSS compilation
-
-```python
-# Original compile-mode behavior
-if env.compile_mode:
-    contents = compressor.compress(
-        cls._clean_source_contents(contents),
-        'css',
-        load_paths=cls.SCSS_LOAD_PATHS
-    )
-```
-
-## Runtime: Jammer
-
-The Jammer serves combo URLs using the manifest:
-
-### Key Behaviors
-
-1. **Use sorted_deps for ordering** - Dependencies ordered per `content_type_manifest.sorted_deps`
-2. **Star dependency expansion** - `paste.*` expands to all matching modules
-3. **Filter loaded deps** - `filter_loaded()` removes already-loaded dependencies
-4. **Read via primer** - `read_contents()` calls `primer.read_primed()` for on-the-fly compilation
-
-### Dependency Resolution
-
-```python
-# Order dependencies according to manifest sorted_deps
-def _order_dependencies(self, dependencies):
-    ordered_dependencies = OrderedDict()
-    for name, path, version in self.content_type_manifest.sorted_deps:
-        if name in dependencies:
-            ordered_dependencies[name] = dependencies.get(name)
-    return ordered_dependencies
-```
-
-### Debug Mode Detection
-
-```python
-@property
-def is_debug(self):
-    return env.compile_mode
-```
-
-In debug mode:
-- SCSS compiled on-the-fly via `primer.read_primed()`
-- Timestamps from source file stats
-- URL uses source paths
 
 ## Runtime Implementation Checklist
 
-Each runtime (Scala, Python, Rust, etc.) MUST implement:
+A language runtime is a thin loader for the shared library. To conform:
 
-- [ ] `jamJsUrl(modules, debug)` - Generate JS combo URL
-- [ ] `jamCssUrl(modules, debug)` - Generate CSS combo URL
-- [ ] `jamBootstrap(modules, cdnBase)` - Generate bootstrap script
-- [ ] `jamInlineBootstrap(pasteJsPath, modules, cdnBase)` - Generate with inlined paste.js
-- [ ] `readFile(path)` - Read from filesystem
-- [ ] `readResource(path)` - Read from classpath/package resources
-- [ ] Combo URL handler for serving concatenated modules
+- [ ] Locate the library: `PASTE_ASSETGRAPH_LIB`, else the bundled `native-lib/{platform}/{file}` copy the package ships.
+- [ ] Call `paste_render` with the settings JSON (`manifest`, `outputBase`, optional `outputJs`/`outputCss`, `cdnBase`, `basePath`, `inlineThreshold`) and the events JSON for page markup.
+- [ ] Call `paste_combo` with the settings JSON and the request path (plus `?` and raw query) for serving.
+- [ ] Free every returned string with `paste_free`; raise the envelope's `error` as the runtime's own error type.
+- [ ] Do **not** implement tag generation, URL construction, dependency expansion, filtering, caching, or combo responses in the runtime.
 
-### Build Tool Checklist
+Existing runtimes: `runtime/scala` (`Paste`, `PastePage`, `PasteComboRoute`), `runtime/node` (`createPaste`), `runtime/python` (`Paste`).
 
-- [ ] Parse `@module` and `@requires` from JS/SCSS files
-- [ ] Expand transitive dependencies at build time
-- [ ] Generate `sorted_deps` (topologically sorted modules)
-- [ ] Compress JS using Closure Compiler (production)
-- [ ] Compile SCSS to CSS using sass (production)
-- [ ] Store raw source paths for compile/debug mode
-- [ ] Version tracking with history
+## Build System Primer
 
-### Combo Handler Checklist
+*(Historical — describes the Python build system JAM originated in.)*
 
-- [ ] Parse combo URL to extract modules, versions, and debug flag
-- [ ] Order modules using `sorted_deps` from manifest
-- [ ] In debug mode: read raw source, compile SCSS on-the-fly
-- [ ] In production mode: read pre-compiled content
-- [ ] Support star dependencies (`paste.*`)
-- [ ] Filter already-loaded dependencies
+The original system used YAML files for asset configuration:
+
+```yaml
+site.theme:
+  source: static/scss/theme.scss
+  output: static/css/theme.css
+  requires: []
+
+site.heroscroll:
+  source: static/js/heroscroll.js
+  output: static/js/heroscroll.js
+  requires:
+    - site.theme
+```
+
+Build script read YAML, compiled SCSS, minified, and generated a JSON manifest.
+
+**Key concept:** Assets are declared modules with explicit dependencies. The build produces a manifest the runtime uses for URL generation and dependency resolution.
+
+## Runtime: Jammer
+
+*(Historical — describes the original Python runtime.)*
+
+The original runtime was a Python class called "Jammer" (`py/source/jammer.py`):
+
+```python
+class Jammer(object):
+    def __init__(self, cache_time=False, read_file=read_file, inline_threshold=1024):
+        self.jams = {}
+        self.cache = LRUCache(1000)
+        # ...
+```
+
+Key methods:
+
+```python
+def jam(self, package, files, media=None, tag_type=None, inline=None):
+    """Record a page's intent to load modules"""
+    self.jams[package].update(dict.fromkeys(files, media))
+
+def dump(self, package=None, media=None):
+    """Generate markup for jams"""
+    # Returns inline content or URL-based tags
+
+def filter_loaded(self, package):
+    """Remove already-loaded modules"""
+    return dict((k, v) for k, v in self.jams[package].items()
+                if k not in self.loads[package])
+```
+
+**Key concepts still operative:**
+
+- `jam()` records intent; `dump()` emits markup. `render` replays this as the events JSON.
+- `filter_loaded` maps to render-time filtering — a module emitted by an earlier group is dropped from later ones — and to the `filter` query, which drops already-delivered names from a served group after ordering.
+- Bounded caching of rendered output has no runtime-side equivalent; caching of parsed manifests lives in the Rust library, keyed on the file's modification stamp.
+
+**Removed:**
+
+- The `exclude` query parameter. Render-time filtering now encodes the exact remaining group in the URL itself; ad-hoc removal on a request uses `filter`.
 
 ## Version History
 
-- **v1.0** (2026-02-03): Initial specification
-- **v1.1** (2026-02-03): Added Primer/Jammer documentation, sorted_deps, expanded dependencies
+- **v1.0** — Original Python implementation (YAML config, Jammer class)
+- **v1.1** — Scala implementation (JamPage, Manifest-based URL generation)
