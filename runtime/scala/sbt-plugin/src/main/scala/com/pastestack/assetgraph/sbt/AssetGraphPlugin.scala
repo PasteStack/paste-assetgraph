@@ -2,10 +2,12 @@ package com.pastestack.assetgraph.sbt
 
 import sbt._
 import sbt.Keys._
+import sbt.io.Using
 import com.pastestack.assetgraph.Binary
-import java.util.zip.ZipFile
 import java.io.File
-import scala.collection.mutable
+import java.nio.file.Files
+import java.util.zip.CRC32
+import scala.collection.JavaConverters._
 
 /**
  * sbt plugin for paste-assetgraph.
@@ -23,10 +25,19 @@ import scala.collection.mutable
  * pasteAssetGraphManifestPath := "target/paste-assetgraph-manifest.json"
  * 
  * // Optional settings
- * pasteAssetGraphIncludePaths := Seq("../paste-elements")
+ * pasteAssetGraphIncludePaths := Seq("vendor/assets")
  * pasteAssetGraphMinify := true
  * pasteAssetGraphSourceMaps := true
+ * pasteAssetGraphOutputLayout := "flat"
+ * pasteAssetGraphBuildDirName := "_paste_build"
  * }}}
+ *
+ * Every directory in pasteAssetGraphSourceDirs is walked recursively and each
+ * file classified by extension — one directory may hold JS and styles together.
+ * With pasteAssetGraphOutputLayout := "beside-source", compiled files land in a
+ * <build-dir-name> directory beside their source instead of under the output
+ * directory, and every manifest output is relative to the project base, which
+ * is then also the runtime's output root.
  * 
  * For Python/Node/HTML projects, use external config file instead.
  */
@@ -41,8 +52,13 @@ object AssetGraphPlugin extends AutoPlugin {
     
     // Build settings
     val pasteAssetGraphMinify = settingKey[Boolean]("Minify output")
+    val pasteAssetGraphOutputLayout = settingKey[String]("Compiled output layout: flat or beside-source")
+    val pasteAssetGraphBuildDirName = settingKey[String]("Directory name beside-source output is written into")
+    val pasteAssetGraphStorageBackend = settingKey[String]("Storage backend for compiled output: local keeps only the current version, dist retains history")
+    val pasteAssetGraphKeepVersions = settingKey[Int]("Versions the dist backend retains per asset")
     val pasteAssetGraphSourceMaps = settingKey[Boolean]("Generate source maps")
     val pasteAssetGraphDebug = settingKey[Boolean]("Build in debug mode")
+    val pasteAssetGraphHashUrls = settingKey[Boolean]("Emit content-hash-qualified combo URLs (jam.hash-urls); false keeps the legacy +vN.0 token shape")
     val pasteAssetGraphBuild = taskKey[Unit]("Build assets")
     val pasteAssetGraphWatch = taskKey[Unit]("Watch assets for changes")
     val pasteAssetGraphWebJarPaths = taskKey[Seq[String]]("Auto-discovered webjar include paths")
@@ -59,8 +75,13 @@ object AssetGraphPlugin extends AutoPlugin {
     pasteAssetGraphManifestPath := "", // Will be set from resourceManaged
     pasteAssetGraphIncludePaths := Seq.empty,
     pasteAssetGraphMinify := true,
+    pasteAssetGraphOutputLayout := "flat",
+    pasteAssetGraphBuildDirName := "_paste_build",
     pasteAssetGraphSourceMaps := true,
     pasteAssetGraphDebug := false,
+    pasteAssetGraphHashUrls := true,
+    pasteAssetGraphStorageBackend := "local",
+    pasteAssetGraphKeepVersions := 10,
     
     pasteAssetGraphWebJarPaths := {
       val cp = (Compile / dependencyClasspath).value
@@ -73,44 +94,36 @@ object AssetGraphPlugin extends AutoPlugin {
       val base = baseDirectory.value
       val debug = pasteAssetGraphDebug.value
       val resourceManagedDir = (Compile / resourceManaged).value
-      
-      // Manifest goes to resourceManaged (sbt-web style)
-      val manifestPath = if (pasteAssetGraphManifestPath.value.nonEmpty) {
-        pasteAssetGraphManifestPath.value
-      } else {
-        (resourceManagedDir / "paste-assetgraph-manifest.json").relativeTo(base).map(_.getPath).getOrElse(
-          resourceManagedDir.getPath + "/paste-assetgraph-manifest.json"
-        )
-      }
-      
+
       // Ensure resourceManaged exists
       IO.createDirectory(resourceManagedDir)
-      
+
       // Merge manual include paths with auto-discovered webjar paths
       val webjarPaths = pasteAssetGraphWebJarPaths.value
       val allIncludes = pasteAssetGraphIncludePaths.value ++ webjarPaths
-      
-      // Log webjar paths for debugging
-      if (webjarPaths.nonEmpty) {
-        log.info(s"Auto-discovered webjar paths: ${webjarPaths.mkString(", ")}")
-      }
-      
+
       // Generate config from settings
       val configFile = base / "target" / "paste-assetgraph-generated.conf"
-      val config = generateConfig(
+      writeGeneratedConfig(
+        log,
+        base,
+        configFile,
+        resourceManagedDir,
+        pasteAssetGraphManifestPath.value,
         pasteAssetGraphSourceDirs.value,
         pasteAssetGraphOutputDir.value,
-        manifestPath,
         allIncludes,
         pasteAssetGraphMinify.value,
         pasteAssetGraphSourceMaps.value,
-        debug
+        debug,
+        pasteAssetGraphStorageBackend.value,
+        pasteAssetGraphKeepVersions.value,
+        pasteAssetGraphOutputLayout.value,
+        pasteAssetGraphBuildDirName.value,
+        webjarPaths,
+        pasteAssetGraphHashUrls.value
       )
-      
-      // Write config
-      IO.createDirectory(configFile.getParentFile)
-      IO.write(configFile, config)
-      
+
       log.info("Building assets with paste-assetgraph...")
       
       val targetDir = (base / "target").toPath
@@ -127,102 +140,201 @@ object AssetGraphPlugin extends AutoPlugin {
       val log = streams.value.log
       val base = baseDirectory.value
       val configFile = base / "target" / "paste-assetgraph-generated.conf"
-      
-      // Task and setting values are resolved before the branch below: a regular
-      // task evaluates every dependency it names regardless of any `if`, so
-      // reading them here is what actually happens.
       val resourceManagedDir = (Compile / resourceManaged).value
-      val configuredManifestPath = pasteAssetGraphManifestPath.value
       val webjarPaths = pasteAssetGraphWebJarPaths.value
       val allIncludes = pasteAssetGraphIncludePaths.value ++ webjarPaths
-      val sourceDirs = pasteAssetGraphSourceDirs.value
-      val outputDir = pasteAssetGraphOutputDir.value
-      val minify = pasteAssetGraphMinify.value
-      val sourceMaps = pasteAssetGraphSourceMaps.value
-      val debug = pasteAssetGraphDebug.value
 
-      // Ensure config exists before watching (generate if missing)
-      if (!configFile.exists()) {
-        log.info("Generating config file before watch...")
-        val manifestPath = if (configuredManifestPath.nonEmpty) {
-          configuredManifestPath
-        } else {
-          (resourceManagedDir / "paste-assetgraph-manifest.json").relativeTo(base).map(_.getPath).getOrElse(
-            resourceManagedDir.getPath + "/paste-assetgraph-manifest.json"
-          )
-        }
-        
-        val config = generateConfig(
-          sourceDirs,
-          outputDir,
-          manifestPath,
-          allIncludes,
-          minify,
-          sourceMaps,
-          debug
-        )
-        IO.createDirectory(configFile.getParentFile)
-        IO.write(configFile, config)
-        
-        // Log webjar paths for debugging
-        if (webjarPaths.nonEmpty) {
-          log.info(s"Auto-discovered webjar paths: ${webjarPaths.mkString(", ")}")
-        }
-      }
-      
+      // Always regenerate: settings changed since the last build (layout,
+      // source dirs, backend) must reach watch too, not just a missing file.
+      writeGeneratedConfig(
+        log,
+        base,
+        configFile,
+        resourceManagedDir,
+        pasteAssetGraphManifestPath.value,
+        pasteAssetGraphSourceDirs.value,
+        pasteAssetGraphOutputDir.value,
+        allIncludes,
+        pasteAssetGraphMinify.value,
+        pasteAssetGraphSourceMaps.value,
+        pasteAssetGraphDebug.value,
+        pasteAssetGraphStorageBackend.value,
+        pasteAssetGraphKeepVersions.value,
+        pasteAssetGraphOutputLayout.value,
+        pasteAssetGraphBuildDirName.value,
+        webjarPaths,
+        pasteAssetGraphHashUrls.value
+      )
+
       log.info("Watching assets for changes...")
       val targetDir = (base / "target").toPath
-      Binary.watch(targetDir, configFile.absolutePath, Some(base.absolutePath))
+      val process = Binary.watch(targetDir, configFile.absolutePath, Some(base.absolutePath))
+      try {
+        val exitCode = process.exitValue()
+        if (exitCode != 0) sys.error(s"paste-assetgraph watch failed with exit code $exitCode")
+      } finally process.destroy()
     },
     
-    // Build assets and register manifest as a managed resource.
+    // Build assets and register the manifest as a managed resource.
     // resourceGenerators runs before compile, ensuring:
     // 1. Assets are built first (manifest generated)
-    // 2. Manifest appears on the classpath (Manifest.loadFromClasspath() works)
+    // 2. Manifest appears on the classpath (Paste.fromClasspath() works)
+    // The managed copy is the one canonical resource wherever the build
+    // actually wrote its history JSON.
     Compile / resourceGenerators += Def.task {
       pasteAssetGraphBuild.value
-      val resourceManagedDir = (Compile / resourceManaged).value
-      val manifestFile = resourceManagedDir / "paste-assetgraph-manifest.json"
-      if (manifestFile.exists()) Seq(manifestFile) else Seq.empty
-    }.taskValue
+      Seq(materializeManifest(
+        baseDirectory.value,
+        (Compile / resourceManaged).value,
+        pasteAssetGraphManifestPath.value
+      ))
+    }.taskValue,
+
+    // A configured manifest that lives under unmanaged resources would also be
+    // picked up verbatim; the managed copy is the canonical resource, so the
+    // on-disk original stays out of the jar.
+    Compile / unmanagedResources / excludeFilter := {
+      val configured = pasteAssetGraphManifestPath.value
+      val existing = (Compile / unmanagedResources / excludeFilter).value
+      if (configured.isEmpty) existing
+      else {
+        val manifestSource = configuredManifest(
+          baseDirectory.value,
+          (Compile / resourceManaged).value,
+          configured
+        ).getCanonicalFile
+        existing || new SimpleFileFilter(_.getCanonicalFile == manifestSource)
+      }
+    }
   )
+
+  /** The file the build writes its manifest to: the managed resource name
+    * when no path is configured, else the configured path resolved against
+    * the project base. */
+  private[sbt] def configuredManifest(base: File, managed: File, configured: String): File =
+    if (configured.isEmpty) managed / "paste-assetgraph-manifest.json"
+    else { val path = new File(configured); if (path.isAbsolute) path else base / configured }
+
+  /** Guarantee the managed manifest resource exists: require the configured
+    * source was generated, then copy it under the canonical managed name
+    * unless source and target are already the same file. */
+  private[sbt] def materializeManifest(base: File, managed: File, configured: String): File = {
+    val source = configuredManifest(base, managed, configured)
+    require(source.isFile, s"Asset manifest was not generated: $source")
+    val target = managed / "paste-assetgraph-manifest.json"
+    if (source.getCanonicalFile != target.getCanonicalFile) {
+      IO.createDirectory(managed)
+      IO.copyFile(source, target)
+    }
+    target
+  }
   
   private def escapeHoconValue(s: String): String =
     s.replace("\\", "\\\\").replace("\"", "\\\"")
-  
-  private def generateConfig(
+
+  /** Resolve the manifest path, regenerate `configFile` from the current
+    * settings and write it — unconditionally, so a setting changed since the
+    * last build (layout, source dirs, backend) reaches watch as well. Both
+    * pasteAssetGraphBuild and pasteAssetGraphWatch go through here so the two
+    * paths cannot drift. */
+  private[sbt] def writeGeneratedConfig(
+    log: Logger,
+    base: File,
+    configFile: File,
+    resourceManagedDir: File,
+    configuredManifestPath: String,
+    sourceDirs: Seq[String],
+    outputDir: String,
+    allIncludes: Seq[String],
+    minify: Boolean,
+    sourceMaps: Boolean,
+    debug: Boolean,
+    storageBackend: String,
+    keepVersions: Int,
+    outputLayout: String,
+    buildDirName: String,
+    webjarPaths: Seq[String],
+    hashUrls: Boolean = true
+  ): Unit = {
+    // Manifest goes to resourceManaged (sbt-web style)
+    val manifestPath = if (configuredManifestPath.nonEmpty) {
+      configuredManifestPath
+    } else {
+      (resourceManagedDir / "paste-assetgraph-manifest.json").relativeTo(base).map(_.getPath).getOrElse {
+        log.warn(
+          s"manifest path ${resourceManagedDir.getPath}/paste-assetgraph-manifest.json is absolute; " +
+            "it makes the generated config machine-specific"
+        )
+        resourceManagedDir.getPath + "/paste-assetgraph-manifest.json"
+      }
+    }
+
+    // Log webjar paths for debugging
+    if (webjarPaths.nonEmpty) {
+      log.info(s"Auto-discovered webjar paths: ${webjarPaths.mkString(", ")}")
+    }
+
+    val config = generateConfig(
+      sourceDirs,
+      outputDir,
+      manifestPath,
+      allIncludes,
+      minify,
+      sourceMaps,
+      debug,
+      storageBackend,
+      keepVersions,
+      outputLayout,
+      buildDirName,
+      hashUrls
+    )
+    IO.createDirectory(configFile.getParentFile)
+    IO.write(configFile, config)
+  }
+
+  private[sbt] def generateConfig(
     sourceDirs: Seq[String],
     outputDir: String,
     manifestPath: String,
     includePaths: Seq[String],
     minify: Boolean,
     sourceMaps: Boolean,
-    debugMode: Boolean
+    debugMode: Boolean,
+    storageBackend: String,
+    keepVersions: Int,
+    outputLayout: String,
+    buildDirName: String,
+    hashUrls: Boolean = true
   ): String = {
-    // Flat key format for Rust parser
-    val scssDir = escapeHoconValue(sourceDirs.find(_.contains("scss")).getOrElse("src/main/assets/scss"))
-    val jsDir = escapeHoconValue(sourceDirs.find(_.contains("js")).getOrElse("src/main/assets/js"))
+    // Flat key format for Rust parser. Every configured source dir goes in
+    // verbatim and in order — each is walked recursively and classified by
+    // extension, so a dir like src/main/web that holds JS and styles
+    // together is not silently dropped.
+    val escapedSourceDirs = sourceDirs.map(s => s""""${escapeHoconValue(s)}"""").mkString(", ")
     val escapedOutputDir = escapeHoconValue(outputDir)
     val escapedManifestPath = escapeHoconValue(manifestPath)
     val escapedIncludes = includePaths.map(s => s""""${escapeHoconValue(s)}"""").mkString(", ")
-    
+
     s"""# Auto-generated by sbt AssetGraphPlugin
 # Do not edit - configure in build.sbt instead
 
-source.scss = "$scssDir"
-source.js = "$jsDir"
-source.images = "src/main/assets/images"
+source.dirs = [$escapedSourceDirs]
 output.base = "$escapedOutputDir"
 output.js = "$escapedOutputDir/js"
 output.css = "$escapedOutputDir/css"
 output.images = "$escapedOutputDir/images"
+output.layout = "${escapeHoconValue(outputLayout)}"
+output.build-dir-name = "${escapeHoconValue(buildDirName)}"
 manifest = "$escapedManifestPath"
 include-paths = [$escapedIncludes]
 debug-mode = $debugMode
 minify = $minify
 source-maps = $sourceMaps
+storage.backend = "${escapeHoconValue(storageBackend)}"
+storage.keep-versions = $keepVersions
 jam.enabled = true
 jam.base-path = "/paste"
+jam.hash-urls = $hashUrls
 """
   }
   
@@ -233,6 +345,9 @@ jam.base-path = "/paste"
         !part.exists(character => character == '\\' || character == ':' || Character.isISOControl(character))
     }
     require(safeSegments, "Unsafe WebJar archive entry")
+    // A jar-shipped `.extracted` at the group root would overwrite the
+    // freshness marker and make an incomplete extraction look complete.
+    require(parts.drop(2) != Seq(".extracted"), "Unsafe WebJar archive entry")
 
     val root = extractDir.getCanonicalFile.toPath
     val directory = root.resolve(parts(0)).resolve(parts(1))
@@ -248,101 +363,150 @@ jam.base-path = "/paste"
     (canonicalDirectory.toFile, canonicalFile.toFile)
   }
 
+  /** A single webjar member resolved against the extraction root: the jar it
+    * came from, its archive name, the artifact-version directory it belongs
+    * to, and its validated target file with the archive-recorded size and
+    * checksum used for freshness validation. */
+  private final case class WebjarEntry(
+    jar: File,
+    name: String,
+    directory: File,
+    file: File,
+    size: Long,
+    crc: Long
+  )
+
   /**
    * Extract webjars from classpath JARs to target directory.
-   * Returns Seq of extracted top-level directories.
+   * Returns the extracted artifact-version directories in classpath order —
+   * the first root on the classpath wins, so include-path precedence matches
+   * dependency order. Any unreadable archive or extraction failure aborts the
+   * build; a dependency is never silently omitted.
    */
   private[sbt] def extractWebjars(classpath: Classpath, extractDir: File, log: Logger): Seq[String] = {
+    val jars = classpath.toList
+      .map(_.data)
+      .filter(jar => jar.isFile && jar.getName.endsWith(".jar"))
+
+    // Describe every member up front, closing each archive before any write —
+    // a jar unreadable at scan time fails before directories are deleted.
+    val entries = jars.flatMap(jar => webjarEntries(jar, extractDir))
+
+    // Group by artifact-version directory in first-seen order. When several
+    // jars contribute to the same directory the first jar's entry wins for a
+    // shared path, matching classpath precedence.
+    val groups = entries.map(_.directory).distinct.map { directory =>
+      val expected = entries.filter(_.directory == directory)
+        .foldLeft(Vector.empty[WebjarEntry]) { (unique, entry) =>
+          if (unique.exists(_.file == entry.file)) unique else unique :+ entry
+        }
+      directory -> expected
+    }
+
+    groups.map { case (directory, expected) =>
+      if (!webjarGroupIsFresh(directory, expected)) {
+        extractWebjarGroup(directory, expected, log)
+      }
+      directory.getCanonicalPath
+    }
+  }
+
+  /** Read one jar's webjar members into descriptors without writing anything. */
+  private def webjarEntries(jar: File, extractDir: File): List[WebjarEntry] = {
     val webjarPrefix = "META-INF/resources/webjars/"
-    val extractedPaths = mutable.Set[String]()
-    val extractedDirs = mutable.Set[String]()
-    val cleanedDirs = mutable.Set[String]()
-    
-    classpath.foreach { entry =>
-      val jar = entry.data
-      if (jar.isFile && jar.getName.endsWith(".jar")) {
-        var zipFile: ZipFile = null
-        try {
-          zipFile = new ZipFile(jar)
-          val entries = zipFile.entries()
-          
-          while (entries.hasMoreElements) {
-            val zipEntry = entries.nextElement()
-            val name = zipEntry.getName
-            
-            if (name.startsWith(webjarPrefix) && !zipEntry.isDirectory) {
-              // Parse: META-INF/resources/webjars/{artifactId}/{version}/{path}
-              val relativePath = name.substring(webjarPrefix.length)
-              val parts = relativePath.split("/", 3)
-              
-              // Require artifactId, version, AND a non-empty file path
-              if (parts.length >= 3 && parts(2).nonEmpty) {
-                val (targetDir, targetFile) = validatedWebjarPaths(extractDir, relativePath)
-                
-                // Check if already extracted and up-to-date
-                val markerFile = targetDir / ".extracted"
-                if (!markerFile.exists() || markerFile.lastModified() < jar.lastModified()) {
-                  // Clean stale directory on first stale entry to remove old files
-                  if (cleanedDirs.add(targetDir.getAbsolutePath)) {
-                    IO.delete(targetDir)
-                  }
-                  IO.createDirectory(targetFile.getParentFile)
-                  val in = zipFile.getInputStream(zipEntry)
-                  try {
-                    IO.transfer(in, targetFile)
-                    log.debug(s"Extracted webjar: $name -> $targetFile")
-                  } finally {
-                    in.close()
-                  }
-                  
-                  // Mark this directory for extraction marker
-                  extractedDirs += targetDir.getAbsolutePath
-                }
-                
-                if (!extractedPaths.contains(targetDir.getAbsolutePath)) {
-                  extractedPaths += targetDir.getAbsolutePath
-                }
-              }
-            }
+    Using.zipFile(jar) { zipFile =>
+      // Collect: META-INF/resources/webjars/{artifactId}/{version}/{path}
+      // entries, requiring artifactId, version, AND a non-empty file path.
+      zipFile.entries().asScala.toList.flatMap { zipEntry =>
+        val name = zipEntry.getName
+        if (name.startsWith(webjarPrefix) && !zipEntry.isDirectory) {
+          val relativePath = name.substring(webjarPrefix.length)
+          val parts = relativePath.split("/", 3)
+          if (parts.length >= 3 && parts(2).nonEmpty) {
+            val (directory, file) = validatedWebjarPaths(extractDir, relativePath)
+            List(WebjarEntry(jar, name, directory, file, zipEntry.getSize, zipEntry.getCrc))
+          } else List.empty
+        } else List.empty
+      }
+    }
+  }
+
+  /** A group is fresh only when its marker exists and the regular files on
+    * disk are exactly the expected set, each still matching the archive's
+    * size and CRC32 — content, not timestamps, decides staleness. */
+  private def webjarGroupIsFresh(directory: File, expected: Vector[WebjarEntry]): Boolean =
+    directory.isDirectory &&
+      new File(directory, ".extracted").isFile &&
+      regularFiles(directory) == expected.map(_.file).toSet &&
+      expected.forall(entry => fileMatchesArchive(entry.file.toPath, entry.size, entry.crc))
+
+  /** Regular files under a directory, canonicalized; the extraction marker
+    * at the group root is not part of the content set. */
+  private def regularFiles(directory: File): Set[File] = {
+    val stream = Files.walk(directory.toPath)
+    try {
+      stream.iterator().asScala
+        .filter(Files.isRegularFile(_))
+        .map(_.toFile.getCanonicalFile)
+        .toSet - new File(directory, ".extracted").getCanonicalFile
+    } finally stream.close()
+  }
+
+  private def fileMatchesArchive(path: java.nio.file.Path, size: Long, crc: Long): Boolean =
+    Files.isRegularFile(path) && Files.size(path) == size && crcOf(path) == crc
+
+  private def crcOf(path: java.nio.file.Path): Long = {
+    val checksum = new CRC32
+    scala.util.Using.resource(Files.newInputStream(path)) { in =>
+      val buffer = new Array[Byte](64 * 1024)
+      var read = in.read(buffer)
+      while (read >= 0) {
+        checksum.update(buffer, 0, read)
+        read = in.read(buffer)
+      }
+    }
+    checksum.getValue
+  }
+
+  /** Replace a stale group: the validated directory is deleted once, every
+    * descriptor's jar is reopened and the entry streamed to its validated
+    * target, and the marker is touched only after all writes succeed — a
+    * group that fails mid-extraction is never marked complete. */
+  private def extractWebjarGroup(directory: File, expected: Vector[WebjarEntry], log: Logger): Unit = {
+    IO.delete(directory)
+    expected.map(_.jar).distinct.foreach { jar =>
+      Using.zipFile(jar) { zipFile =>
+        expected.filter(_.jar == jar).foreach { entry =>
+          val zipEntry = zipFile.getEntry(entry.name)
+          require(zipEntry != null, s"WebJar entry disappeared from ${jar.getName}: ${entry.name}")
+          IO.createDirectory(entry.file.getParentFile)
+          Using.zipEntry(zipFile)(zipEntry) { in =>
+            IO.transfer(in, entry.file)
           }
-          
-          // Create marker files after processing all entries
-          extractedDirs.foreach { dir =>
-            val markerFile = new File(dir) / ".extracted"
-            IO.touch(markerFile)
-          }
-          extractedDirs.clear()
-          
-        } catch {
-          case e: IllegalArgumentException => throw e
-          case e: Exception =>
-            log.warn(s"Failed to extract webjars from ${jar.getName}: ${e.getMessage}")
-        } finally {
-          if (zipFile != null) {
-            try {
-              zipFile.close()
-            } catch {
-              case e: Exception => log.debug(s"Failed to close zip file ${jar.getName}: ${e.getMessage}")
-            }
-          }
+          // The descriptor was recorded at scan time; if the jar changed
+          // under us the extracted bytes no longer match its checksum.
+          require(
+            fileMatchesArchive(entry.file.toPath, entry.size, entry.crc),
+            s"WebJar entry changed while extracting: ${entry.name}"
+          )
+          log.debug(s"Extracted webjar: ${entry.name} -> ${entry.file}")
         }
       }
     }
-    
-    extractedPaths.toSeq
+    IO.touch(new File(directory, ".extracted"))
   }
   
   /**
    * Convenience helpers for common paste setup.
    */
-  def withPaste(version: String = "2.0.1"): Seq[Setting[_]] = Seq(
+  def withPaste(version: String = "2.1.0"): Seq[Setting[_]] = Seq(
     libraryDependencies += "com.pastestack" % "paste-webjar" % version
   )
   
-  def withPasteElements(version: String = "0.1.0"): Seq[Setting[_]] = Seq(
+  def withPasteElements(version: String = "0.4.0"): Seq[Setting[_]] = Seq(
     libraryDependencies += "com.pastestack" % "paste-elements-webjar" % version
   )
   
-  def withPasteStack(pasteVersion: String = "2.0.1", elementsVersion: String = "0.1.0"): Seq[Setting[_]] =
+  def withPasteStack(pasteVersion: String = "2.1.0", elementsVersion: String = "0.4.0"): Seq[Setting[_]] =
     withPaste(pasteVersion) ++ withPasteElements(elementsVersion)
 }

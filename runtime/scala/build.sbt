@@ -2,6 +2,9 @@ import com.tomshley.magicroot.sbt.projectsettings.{PublishGitLabPlugin, Tomshley
 
 ThisBuild / versionScheme := Some("semver-spec")
 
+// Runtime tests use the bundled library unless PASTE_ASSETGRAPH_LIB explicitly selects one.
+ThisBuild / Test / fork := true
+
 // Versions come from the repository VERSION file, plus the branch revision CI
 // supplies: the release flow bumps VERSION, and nothing here restates it.
 lazy val commonSettings = Seq(
@@ -18,14 +21,19 @@ lazy val runtime = (project in file("runtime"))
   .settings(
     name := "paste-assetgraph-runtime",
     scalaVersion := "3.3.1",
+    // Ships the bundled native libraries the runtime resolves at run time;
+    // the build-rust CI job fills native-lib/ there before publish.
+    Compile / unmanagedResourceDirectories +=
+      (ThisBuild / baseDirectory).value / ".." / ".." / "runtime" / "native",
     libraryDependencies ++= Seq(
+      "net.java.dev.jna" % "jna" % "5.17.0",
       "io.spray" %% "spray-json" % "1.3.6",
       "org.scalatest" %% "scalatest" % "3.2.17" % Test
     )
   )
 
 lazy val pekko = (project in file("pekko"))
-  .dependsOn(runtime)
+  .dependsOn(runtime % "compile->compile;test->test")
   .enablePlugins(VersionFilePlugin, TomshleyCIBuildVersionPlugin, PublishGitLabPlugin)
   .settings(commonSettings)
   .settings(
@@ -35,6 +43,8 @@ lazy val pekko = (project in file("pekko"))
       "org.apache.pekko" %% "pekko-http" % "1.0.1",
       "org.apache.pekko" %% "pekko-actor-typed" % "1.0.2",
       "org.apache.pekko" %% "pekko-stream" % "1.0.2",
+      "org.apache.pekko" %% "pekko-http-testkit" % "1.0.1" % Test,
+      "org.apache.pekko" %% "pekko-stream-testkit" % "1.0.2" % Test,
       "org.scalatest" %% "scalatest" % "3.2.17" % Test
     )
   )

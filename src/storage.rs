@@ -118,41 +118,13 @@ impl StorageBackend {
         filename: &str,   // "app.abc123.v1.min.js"
     ) -> Result<String> {
         match self {
-            StorageBackend::Local { .. } => {
+            StorageBackend::Local { .. } | StorageBackend::Dist { .. } => {
                 let dir = self.resolve_dir(asset_type);
                 let file_path = dir.join(filename);
-                // Create parent directories (filename may contain subdirs, e.g., "paste/dom.v1.min.js")
-                if let Some(parent) = file_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&file_path, content)?;
-                Ok(format!("/{}/{}", asset_type, filename))
-            }
-
-            StorageBackend::Dist { .. } => {
-                let dir = self.resolve_dir(asset_type);
-                let file_path = dir.join(filename);
-
-                // Create parent directories (filename may contain subdirs, e.g., "paste/dom.v1.min.js")
-                if let Some(parent) = file_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-
-                // Write if file doesn't exist, or if existing content differs.
-                // Compare actual bytes, not just length — same-length content
-                // with different bytes must still be written (e.g., hash collision).
-                let should_write = if file_path.exists() {
-                    match fs::read(&file_path) {
-                        Ok(existing) => existing != content,
-                        Err(_) => true,
-                    }
-                } else {
-                    true
-                };
-                if should_write {
-                    fs::write(&file_path, content)?;
-                }
-
+                // Both filesystem backends share the write-if-different
+                // rule: unchanged bytes keep their mtime, different bytes
+                // repair the file.
+                self.write_file(&file_path, content)?;
                 Ok(format!("/{}/{}", asset_type, filename))
             }
 
@@ -163,6 +135,39 @@ impl StorageBackend {
                     bucket, prefix, asset_type, filename
                 );
                 Ok(format!("/{}/{}", asset_type, filename))
+            }
+        }
+    }
+
+    /// Write `content` to an already-resolved file path. Both filesystem
+    /// backends compare before writing: unchanged bytes stay untouched —
+    /// committed dist output and local build output alike keep their mtime —
+    /// while bytes that differ (a tampered or truncated file) are repaired.
+    /// Compare actual bytes, not just length — same-length content with
+    /// different bytes must still be written.
+    pub fn write_file(&self, file: &Path, content: &[u8]) -> Result<()> {
+        match self {
+            StorageBackend::Local { .. } | StorageBackend::Dist { .. } => {
+                if let Some(parent) = file.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let should_write = if file.exists() {
+                    match fs::read(file) {
+                        Ok(existing) => existing != content,
+                        Err(_) => true,
+                    }
+                } else {
+                    true
+                };
+                if should_write {
+                    fs::write(file, content)?;
+                }
+                Ok(())
+            }
+            StorageBackend::S3 { .. } => {
+                // Future: upload to S3
+                eprintln!("S3 write not implemented: {}", file.display());
+                Ok(())
             }
         }
     }
@@ -180,132 +185,72 @@ impl StorageBackend {
         }
     }
 
-    /// Prune old versions, keeping only the most recent N
-    pub fn prune_versions(&self, asset_type: &str, base_name: &str) -> Result<()> {
-        match self {
-            StorageBackend::Local { .. } => {
-                // Local keeps only the current version — prune all old versions
-                let dir = self.resolve_dir(asset_type);
-                if !dir.exists() {
-                    return Ok(());
-                }
+    /// Prune old versions of the asset whose current version sits at
+    /// `current` — a resolved compiled file named
+    /// `{stem}.{32-hex hash}.v{N}.min.{ext}`.
+    ///
+    /// Matches are exact on the stem: pruning `site` never counts
+    /// `site.theme`'s files the way a `"{stem}."` prefix did. The directory
+    /// comes from the resolved file itself, so the same code prunes flat
+    /// type dirs and beside-source build dirs. `retained` holds the resolved
+    /// files the manifest's history still references — the caller derives it
+    /// from the manifest, not from a count, so a stray file that happens to
+    /// share a version number can never displace a version the manifest
+    /// still serves. `current` and every retained path survive; a missing
+    /// file is not an error.
+    pub fn prune_versions(&self, current: &Path, retained: &[PathBuf]) -> Result<()> {
+        if matches!(self, StorageBackend::S3 { .. }) {
+            return Ok(());
+        }
+        let Some(name) = current.file_name().and_then(|n| n.to_str()) else {
+            return Ok(());
+        };
+        let Some((file_stem, ext)) = Self::split_versioned_name(name) else {
+            return Ok(());
+        };
+        let Some(scan_dir) = current.parent() else {
+            return Ok(());
+        };
+        if !scan_dir.exists() {
+            return Ok(());
+        }
 
-                // base_name may contain subdirectories (e.g., "paste/dom").
-                let (scan_dir, file_stem) = if let Some(slash_pos) = base_name.rfind('/') {
-                    (
-                        dir.join(&base_name[..slash_pos]),
-                        &base_name[slash_pos + 1..],
-                    )
-                } else {
-                    (dir, base_name)
-                };
-
-                if !scan_dir.exists() {
-                    return Ok(());
-                }
-
-                // Find all versions of this asset and keep only the latest
-                let prefix = format!("{}.", file_stem);
-                let mut versions: Vec<(u32, PathBuf)> = Vec::new();
-
-                for entry in fs::read_dir(&scan_dir)? {
-                    let entry = entry?;
-                    let name = entry.file_name().to_string_lossy().to_string();
-
-                    if !name.starts_with(&prefix) {
-                        continue;
-                    }
-
-                    if let Some(version) = Self::extract_version(&name) {
-                        versions.push((version, entry.path()));
-                    }
-                }
-
-                // Sort by version descending, remove all but the latest
-                versions.sort_by(|a, b| b.0.cmp(&a.0));
-                for (_, path) in versions.iter().skip(1) {
-                    if let Err(e) = fs::remove_file(path) {
-                        eprintln!("Warning: failed to prune {}: {}", path.display(), e);
-                    }
-                }
-
-                Ok(())
+        let versioned = Regex::new(&format!(
+            r"^{}\.[0-9a-f]{{32}}\.v\d+\.min\.{}$",
+            regex::escape(file_stem),
+            regex::escape(ext)
+        ))?;
+        for entry in fs::read_dir(scan_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !versioned.is_match(&name) {
+                continue;
             }
-
-            StorageBackend::Dist { keep_versions, .. } => {
-                let dir = self.resolve_dir(asset_type);
-                if !dir.exists() {
-                    return Ok(());
-                }
-
-                // base_name may contain subdirectories (e.g., "paste/dom").
-                // Split into subdir + file stem so we scan the correct directory.
-                let (scan_dir, file_stem) = if let Some(slash_pos) = base_name.rfind('/') {
-                    (
-                        dir.join(&base_name[..slash_pos]),
-                        &base_name[slash_pos + 1..],
-                    )
-                } else {
-                    (dir, base_name)
-                };
-
-                if !scan_dir.exists() {
-                    return Ok(());
-                }
-
-                // Find all versions of this asset
-                // Filename format: {file_stem}.{hash}.v{N}.min.{ext}
-                let prefix = format!("{}.", file_stem);
-                let mut versions: Vec<(u32, PathBuf)> = Vec::new();
-
-                for entry in fs::read_dir(&scan_dir)? {
-                    let entry = entry?;
-                    let name = entry.file_name().to_string_lossy().to_string();
-
-                    // Must start with file_stem followed by a dot
-                    if !name.starts_with(&prefix) {
-                        continue;
-                    }
-
-                    // Extract version number from ".v{N}." pattern (last match)
-                    if let Some(version) = Self::extract_version(&name) {
-                        versions.push((version, entry.path()));
-                    }
-                }
-
-                // Sort by version descending
-                versions.sort_by(|a, b| b.0.cmp(&a.0));
-
-                // Remove old versions beyond keep_versions
-                for (_, path) in versions.iter().skip(*keep_versions) {
-                    if let Err(e) = fs::remove_file(path) {
-                        eprintln!("Warning: failed to prune {}: {}", path.display(), e);
-                    }
-                }
-
-                Ok(())
+            let path = entry.path();
+            if path == current || retained.contains(&path) {
+                continue;
             }
-
-            StorageBackend::S3 { .. } => {
-                // Future: prune S3 objects
-                Ok(())
+            match fs::remove_file(&path) {
+                // Already gone — a file removed between the scan and the
+                // delete is not a pruning failure.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                result => result?,
             }
         }
+
+        Ok(())
     }
 
-    /// Extract version number from a filename matching the `.v{N}.` pattern.
-    /// Searches for the *last* occurrence to avoid false matches like `.vue`.
-    fn extract_version(name: &str) -> Option<u32> {
+    /// Split a versioned filename `{stem}.{32-hex hash}.v{N}.min.{ext}` into
+    /// (stem, ext); anything else is not a compiled asset and returns None.
+    fn split_versioned_name(name: &str) -> Option<(&str, &str)> {
         thread_local! {
-            static VERSION_RE: Regex = Regex::new(r"\.v(\d+)\.").unwrap();
+            static NAME_RE: Regex =
+                Regex::new(r"^(.*)\.[0-9a-f]{32}\.v\d+\.min\.([^.]+)$").unwrap();
         }
-        VERSION_RE.with(|re| {
-            // Take the last match to avoid false positives like `.vue-fixes`
-            re.find_iter(name).last().and_then(|m| {
-                // Extract digits between ".v" and "."
-                let matched = m.as_str();
-                matched[2..matched.len() - 1].parse::<u32>().ok()
-            })
+        NAME_RE.with(|re| {
+            let caps = re.captures(name)?;
+            Some((caps.get(1)?.as_str(), caps.get(2)?.as_str()))
         })
     }
 
@@ -324,6 +269,17 @@ impl StorageBackend {
             StorageBackend::Dist { .. } | StorageBackend::S3 { .. } => true,
         }
     }
+}
+
+/// Whether `path`'s filename has the generated
+/// `{stem}.{32-hex hash}.v{N}.min.{ext}` shape — the exact predicate pruning
+/// uses. Source discovery consults it so generated output can never feed a
+/// later build back in as a source, even from a build directory whose
+/// configured name has since changed.
+pub(crate) fn is_versioned_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| StorageBackend::split_versioned_name(name).is_some())
 }
 
 #[cfg(test)]
@@ -355,76 +311,130 @@ mod tests {
         assert!(dir.path().join("js/app.v2.js").exists());
     }
 
+    /// A 32-hex-char hash for a versioned test filename.
+    fn hash(ch: char) -> String {
+        ch.to_string().repeat(32)
+    }
+
     #[test]
-    fn test_dist_prune_versions_keeps_n_most_recent() {
+    fn test_dist_prune_versions_keeps_current_plus_history() {
+        // The manifest references the current file plus its retained
+        // history entries — keep exactly the files it names.
         let dir = tempdir().unwrap();
-        let storage = StorageBackend::dist(dir.path(), 2); // keep 2
+        let storage = StorageBackend::dist(dir.path(), 2);
 
         // Write 4 versions matching the versioned filename format
-        storage
-            .write_asset(b"v1", "js", "app.aaa.v1.min.js")
-            .unwrap();
-        storage
-            .write_asset(b"v2", "js", "app.bbb.v2.min.js")
-            .unwrap();
-        storage
-            .write_asset(b"v3", "js", "app.ccc.v3.min.js")
-            .unwrap();
-        storage
-            .write_asset(b"v4", "js", "app.ddd.v4.min.js")
-            .unwrap();
+        for (version, ch) in [('1', 'a'), ('2', 'b'), ('3', 'c'), ('4', 'd')] {
+            let name = format!("app.{}.v{version}.min.js", hash(ch));
+            storage
+                .write_asset(version.to_string().as_bytes(), "js", &name)
+                .unwrap();
+        }
 
-        storage.prune_versions("js", "app").unwrap();
+        let current = dir.path().join(format!("js/app.{}.v4.min.js", hash('d')));
+        let retained = vec![
+            dir.path().join(format!("js/app.{}.v2.min.js", hash('b'))),
+            dir.path().join(format!("js/app.{}.v3.min.js", hash('c'))),
+        ];
+        storage.prune_versions(&current, &retained).unwrap();
 
-        // Only v3 and v4 should remain
+        // v2, v3 and v4 remain: the current file plus the two retained
+        // history entries.
         assert!(
-            !dir.path().join("js/app.aaa.v1.min.js").exists(),
+            !dir.path()
+                .join(format!("js/app.{}.v1.min.js", hash('a')))
+                .exists(),
             "v1 should be pruned"
         );
         assert!(
-            !dir.path().join("js/app.bbb.v2.min.js").exists(),
-            "v2 should be pruned"
+            dir.path()
+                .join(format!("js/app.{}.v2.min.js", hash('b')))
+                .exists(),
+            "v2 should remain (a manifest history entry)"
         );
         assert!(
-            dir.path().join("js/app.ccc.v3.min.js").exists(),
+            dir.path()
+                .join(format!("js/app.{}.v3.min.js", hash('c')))
+                .exists(),
             "v3 should remain"
         );
         assert!(
-            dir.path().join("js/app.ddd.v4.min.js").exists(),
+            dir.path()
+                .join(format!("js/app.{}.v4.min.js", hash('d')))
+                .exists(),
             "v4 should remain"
         );
     }
 
     #[test]
-    fn test_local_prune_keeps_only_latest() {
+    fn test_prune_versions_matches_the_exact_stem() {
+        // `app.` was once a prefix match, so pruning `app` counted and
+        // deleted `app.theme`'s file in the same directory.
+        let dir = tempdir().unwrap();
+        let storage = StorageBackend::dist(dir.path(), 0); // keep current only
+
+        let theme = format!("app.theme.{}.v1.min.js", hash('t'));
+        storage.write_asset(b"theme", "js", &theme).unwrap();
+        storage
+            .write_asset(b"v1", "js", &format!("app.{}.v1.min.js", hash('a')))
+            .unwrap();
+        storage
+            .write_asset(b"v2", "js", &format!("app.{}.v2.min.js", hash('b')))
+            .unwrap();
+
+        storage
+            .prune_versions(
+                &dir.path().join(format!("js/app.{}.v2.min.js", hash('b'))),
+                &[],
+            )
+            .unwrap();
+
+        assert!(
+            !dir.path()
+                .join(format!("js/app.{}.v1.min.js", hash('a')))
+                .exists(),
+            "app v1 should be pruned"
+        );
+        assert!(
+            dir.path().join(format!("js/{theme}")).exists(),
+            "app.theme must survive pruning app"
+        );
+    }
+
+    #[test]
+    fn test_local_prune_keeps_only_current() {
         let dir = tempdir().unwrap();
         let storage = StorageBackend::local(dir.path());
 
         // Write multiple versions
-        storage
-            .write_asset(b"v1", "js", "app.aaa.v1.min.js")
-            .unwrap();
-        storage
-            .write_asset(b"v2", "js", "app.bbb.v2.min.js")
-            .unwrap();
-        storage
-            .write_asset(b"v3", "js", "app.ccc.v3.min.js")
-            .unwrap();
+        for (version, ch) in [('1', 'a'), ('2', 'b'), ('3', 'c')] {
+            let name = format!("app.{}.v{version}.min.js", hash(ch));
+            storage
+                .write_asset(version.to_string().as_bytes(), "js", &name)
+                .unwrap();
+        }
 
-        storage.prune_versions("js", "app").unwrap();
+        let current = dir.path().join(format!("js/app.{}.v3.min.js", hash('c')));
+        storage.prune_versions(&current, &[]).unwrap();
 
-        // Only the latest version should remain
+        // Only the current file should remain
         assert!(
-            !dir.path().join("js/app.aaa.v1.min.js").exists(),
+            !dir.path()
+                .join(format!("js/app.{}.v1.min.js", hash('a')))
+                .exists(),
             "v1 should be pruned"
         );
         assert!(
-            !dir.path().join("js/app.bbb.v2.min.js").exists(),
+            !dir.path()
+                .join(format!("js/app.{}.v2.min.js", hash('b')))
+                .exists(),
             "v2 should be pruned"
         );
         assert!(
-            dir.path().join("js/app.ccc.v3.min.js").exists(),
-            "v3 (latest) should remain"
+            dir.path()
+                .join(format!("js/app.{}.v3.min.js", hash('c')))
+                .exists(),
+            "v3 (current) should remain"
         );
     }
 
@@ -462,44 +472,93 @@ mod tests {
 
     #[test]
     fn test_dist_prune_versions_nested_module() {
-        // Modules like paste.dom produce files in js/paste/dom.{hash}.v{N}.min.js
-        // prune_versions must handle the nested subdirectory correctly.
+        // Modules like paste.dom produce files in js/paste/dom.{hash}.v{N}.min.js —
+        // prune_versions takes the resolved current file and must scan the
+        // nested subdirectory it sits in.
         let dir = tempdir().unwrap();
         let storage = StorageBackend::dist(dir.path(), 2); // keep 2
 
         // Write 4 versions in a nested subdirectory (paste/)
-        storage
-            .write_asset(b"v1", "js", "paste/dom.aaa.v1.min.js")
-            .unwrap();
-        storage
-            .write_asset(b"v2", "js", "paste/dom.bbb.v2.min.js")
-            .unwrap();
-        storage
-            .write_asset(b"v3", "js", "paste/dom.ccc.v3.min.js")
-            .unwrap();
-        storage
-            .write_asset(b"v4", "js", "paste/dom.ddd.v4.min.js")
-            .unwrap();
+        for (version, ch) in [('1', 'a'), ('2', 'b'), ('3', 'c'), ('4', 'd')] {
+            let name = format!("paste/dom.{}.v{version}.min.js", hash(ch));
+            storage
+                .write_asset(version.to_string().as_bytes(), "js", &name)
+                .unwrap();
+        }
 
-        // base_name is "paste/dom" (as computed by graph.rs from key "js/paste/dom.js")
-        storage.prune_versions("js", "paste/dom").unwrap();
+        let current = dir
+            .path()
+            .join(format!("js/paste/dom.{}.v4.min.js", hash('d')));
+        let retained = vec![
+            dir.path()
+                .join(format!("js/paste/dom.{}.v2.min.js", hash('b'))),
+            dir.path()
+                .join(format!("js/paste/dom.{}.v3.min.js", hash('c'))),
+        ];
+        storage.prune_versions(&current, &retained).unwrap();
 
-        // Only v3 and v4 should remain
+        // v2, v3 and v4 remain: current plus keep_versions history entries.
         assert!(
-            !dir.path().join("js/paste/dom.aaa.v1.min.js").exists(),
+            !dir.path()
+                .join(format!("js/paste/dom.{}.v1.min.js", hash('a')))
+                .exists(),
             "v1 should be pruned"
         );
         assert!(
-            !dir.path().join("js/paste/dom.bbb.v2.min.js").exists(),
-            "v2 should be pruned"
+            dir.path()
+                .join(format!("js/paste/dom.{}.v2.min.js", hash('b')))
+                .exists(),
+            "v2 should remain (a manifest history entry)"
         );
         assert!(
-            dir.path().join("js/paste/dom.ccc.v3.min.js").exists(),
+            dir.path()
+                .join(format!("js/paste/dom.{}.v3.min.js", hash('c')))
+                .exists(),
             "v3 should remain"
         );
         assert!(
-            dir.path().join("js/paste/dom.ddd.v4.min.js").exists(),
+            dir.path()
+                .join(format!("js/paste/dom.{}.v4.min.js", hash('d')))
+                .exists(),
             "v4 should remain"
         );
+    }
+
+    #[test]
+    fn test_prune_versions_deletes_stray_same_version_files() {
+        // A version number is not an identity: two files can share it with
+        // different hashes (a stray from an interrupted or relocated build).
+        // Keeping "the newest N" by version could displace a file the
+        // manifest still references; pruning by retained path cannot.
+        let dir = tempdir().unwrap();
+        let storage = StorageBackend::dist(dir.path(), 1);
+
+        let retained_file = format!("app.{}.v1.min.js", hash('a'));
+        let stray = format!("app.{}.v1.min.js", hash('e'));
+        let sibling = format!("app2.{}.v1.min.js", hash('9'));
+        storage.write_asset(b"kept", "js", &retained_file).unwrap();
+        storage.write_asset(b"stray", "js", &stray).unwrap();
+        storage.write_asset(b"sibling", "js", &sibling).unwrap();
+        storage
+            .write_asset(b"current", "js", &format!("app.{}.v2.min.js", hash('b')))
+            .unwrap();
+
+        let current = dir.path().join(format!("js/app.{}.v2.min.js", hash('b')));
+        let retained = vec![dir.path().join(format!("js/{retained_file}"))];
+        storage.prune_versions(&current, &retained).unwrap();
+
+        assert!(
+            !dir.path().join(format!("js/{stray}")).exists(),
+            "a stray same-version file is pruned like any unreferenced version"
+        );
+        assert!(
+            dir.path().join(format!("js/{retained_file}")).exists(),
+            "the manifest-referenced version survives"
+        );
+        assert!(
+            dir.path().join(format!("js/{sibling}")).exists(),
+            "the exact-stem sibling is untouched"
+        );
+        assert!(current.exists(), "the current file survives");
     }
 }
