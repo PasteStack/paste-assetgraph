@@ -53,12 +53,15 @@ pub struct Jam {
 }
 
 /// One render event: `{"jam": {...}}` queues modules, `{"dump": "css"}` or
-/// `{"dump": "js"}` emits that type's queued tags.
+/// `{"dump": "js"}` emits that type's queued tags, and the bare string
+/// `"finish"` seals the page — every jammed module must have been dumped
+/// by then, or the render fails instead of silently dropping it.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Event {
     Jam(Jam),
     Dump(AssetType),
+    Finish,
 }
 
 /// Options controlling URL shape and automatic inlining for `render_all`.
@@ -178,8 +181,9 @@ pub(crate) fn packages_segment(manifest: &Manifest) -> String {
 /// Replay `events` and return one `Rendered` per dump, in order.
 ///
 /// Rendering is stateless: the whole event list is replayed on every call.
-/// The last event must be a dump — a trailing jam would queue modules no
-/// dump ever emits.
+/// The last event must be a dump or `finish` — a trailing jam would queue
+/// modules no dump ever emits. A terminal `finish` adds no `Rendered`; it
+/// only validates that every jammed module was delivered.
 pub fn render_all(
     manifest: &Manifest,
     dirs: &OutputDirs,
@@ -188,44 +192,135 @@ pub fn render_all(
 ) -> Result<Vec<Rendered>> {
     validate_options(opts)?;
 
-    if !matches!(events.last(), Some(Event::Dump(_))) {
-        bail!("the last render event must be a dump");
+    let planned = plan_events(manifest, events)?;
+    let mut rendered = Vec::with_capacity(planned.len());
+    for dump in &planned {
+        rendered.push(match dump {
+            PlannedDump::Css(groups) => dump_css(manifest, dirs, opts, groups)?,
+            PlannedDump::Js { bootstrap, groups } => {
+                dump_js(manifest, dirs, opts, bootstrap.as_deref(), groups)?
+            }
+        });
+    }
+    Ok(rendered)
+}
+
+/// Seal a complete page without rendering: the last event must be
+/// `finish` and every module any jam queued must have been emitted by a
+/// dump of its type — a css module under the same media attribute counts
+/// delivered, under a different one it does not. Validation replays the
+/// same plan the renderer uses, so it expands, orders and dedups exactly
+/// as a render would but never opens an asset file.
+pub(crate) fn validate_finished(manifest: &Manifest, events: &[Event]) -> Result<()> {
+    if !matches!(events.last(), Some(Event::Finish)) {
+        bail!("the last render event must be finish");
+    }
+    plan_events(manifest, events).map(|_| ())
+}
+
+/// One jam's contribution to a dump: the queue entry whose options shape
+/// the tag and the modules it still has to deliver after already-loaded
+/// ones are subtracted.
+struct PlannedGroup<'a> {
+    jam: &'a Jam,
+    modules: Vec<String>,
+}
+
+/// A dump's plan: what its tags will cover. Computed before any tag is
+/// rendered — expansion, ordering and loaded bookkeeping live here once so
+/// `finish` can apply the same rules without re-reading asset files.
+enum PlannedDump<'a> {
+    Css(Vec<PlannedGroup<'a>>),
+    Js {
+        /// The runtime group, present only on the first js dump that has
+        /// pending jams and has not delivered `paste` yet.
+        bootstrap: Option<Vec<String>>,
+        groups: Vec<PlannedGroup<'a>>,
+    },
+}
+
+/// Plan the whole event list: expand every queued jam at its dump, drop
+/// already-loaded modules, and remember what each dump delivered. The last
+/// event must be a dump or `finish`; `finish` anywhere else is an error,
+/// and a `finish` that still has undumped modules fails with their names.
+fn plan_events<'a>(manifest: &Manifest, events: &'a [Event]) -> Result<Vec<PlannedDump<'a>>> {
+    if !matches!(events.last(), Some(Event::Dump(_) | Event::Finish)) {
+        bail!("the last render event must be a dump or finish");
     }
 
     let mut loaded_js: HashSet<String> = HashSet::new();
     let mut loaded_css: HashSet<(String, Option<String>)> = HashSet::new();
-    let mut pending_js: Vec<Jam> = Vec::new();
-    let mut pending_css: Vec<Jam> = Vec::new();
-    let mut rendered = Vec::new();
+    let mut pending_js: Vec<&Jam> = Vec::new();
+    let mut pending_css: Vec<&Jam> = Vec::new();
+    let mut dumps = Vec::new();
 
-    for event in events {
+    for (i, event) in events.iter().enumerate() {
         match event {
             Event::Jam(jam) => {
                 if !jam.css.is_empty() {
-                    pending_css.push(jam.clone());
+                    pending_css.push(jam);
                 }
                 if !jam.js.is_empty() {
-                    pending_js.push(jam.clone());
+                    pending_js.push(jam);
                 }
             }
             Event::Dump(AssetType::Css) => {
-                rendered.push(dump_css(
+                dumps.push(PlannedDump::Css(plan_css(
                     manifest,
-                    dirs,
-                    opts,
                     &pending_css,
                     &mut loaded_css,
-                )?);
+                )?));
                 pending_css.clear();
             }
             Event::Dump(AssetType::Js) => {
-                rendered.push(dump_js(manifest, dirs, opts, &pending_js, &mut loaded_js)?);
+                dumps.push(plan_js(manifest, &pending_js, &mut loaded_js)?);
                 pending_js.clear();
+            }
+            Event::Finish => {
+                if i + 1 != events.len() {
+                    bail!("finish must be the last render event");
+                }
+                let mut missing = Vec::new();
+                let mut seen = HashSet::new();
+                for jam in &pending_css {
+                    for m in expand(manifest, &jam.css, AssetType::Css)?
+                        .into_iter()
+                        .filter(|m| !loaded_css.contains(&(m.clone(), jam.media.clone())))
+                    {
+                        // The same stylesheet under a different media is a
+                        // genuinely different tag, so name it — quoted so
+                        // metacharacters cannot smear the diagnostic.
+                        let label = match &jam.media {
+                            Some(media) => format!("css module {m} (media {media:?})"),
+                            None => format!("css module {m}"),
+                        };
+                        if seen.insert(label.clone()) {
+                            missing.push(label);
+                        }
+                    }
+                }
+                for jam in &pending_js {
+                    for m in expand(manifest, &jam.js, AssetType::Js)?
+                        .into_iter()
+                        .filter(|m| !loaded_js.contains(m))
+                    {
+                        let label = format!("js module {m}");
+                        if seen.insert(label.clone()) {
+                            missing.push(label);
+                        }
+                    }
+                }
+                if !missing.is_empty() {
+                    bail!(
+                        "finish: jammed modules were never dumped: {}",
+                        missing.join(", ")
+                    );
+                }
             }
         }
     }
 
-    Ok(rendered)
+    Ok(dumps)
 }
 
 pub(crate) fn validate_options(opts: &RenderOptions) -> Result<()> {
@@ -239,10 +334,9 @@ pub(crate) fn validate_options(opts: &RenderOptions) -> Result<()> {
 
 /// `base_path` is an absolute URL path of nonempty, normal segments: it is
 /// split off combo request paths verbatim, lands inside HTML attributes and
-/// is embedded in the server's route pattern, so `.`/`..` segments, a
+/// is embedded in the host's route pattern, so `.`/`..` segments, a
 /// trailing slash, whitespace, control characters, the URL/markup
-/// metacharacters and `*` (an axum wildcard that would panic route
-/// registration) are all refused.
+/// metacharacters and route wildcards like `*` are all refused.
 pub(crate) fn validate_base_path(base_path: &str) -> Result<()> {
     if !base_path.starts_with('/')
         || base_path
@@ -307,16 +401,15 @@ fn expand_dedup(manifest: &Manifest, modules: &[String], asset_type: &str) -> Ve
     expanded
 }
 
-fn dump_css(
+/// Plan a css dump: expand each queued jam, drop the modules already
+/// delivered under the same media, and mark the survivors loaded.
+fn plan_css<'a>(
     manifest: &Manifest,
-    dirs: &OutputDirs,
-    opts: &RenderOptions,
-    pending: &[Jam],
+    pending: &[&'a Jam],
     loaded: &mut HashSet<(String, Option<String>)>,
-) -> Result<Rendered> {
-    let mut tags = Vec::new();
-    let mut urls = Vec::new();
-    for jam in pending {
+) -> Result<Vec<PlannedGroup<'a>>> {
+    let mut groups = Vec::new();
+    for &jam in pending {
         // Dedup is per (module, media): the same stylesheet requested with a
         // different media attribute is a genuinely different tag.
         let group: Vec<String> = expand(manifest, &jam.css, AssetType::Css)?
@@ -326,12 +419,29 @@ fn dump_css(
         if group.is_empty() {
             continue;
         }
-        let (tag, url) = css_tag(manifest, dirs, opts, jam, &group)?;
+        loaded.extend(group.iter().map(|m| (m.clone(), jam.media.clone())));
+        groups.push(PlannedGroup {
+            jam,
+            modules: group,
+        });
+    }
+    Ok(groups)
+}
+
+fn dump_css(
+    manifest: &Manifest,
+    dirs: &OutputDirs,
+    opts: &RenderOptions,
+    groups: &[PlannedGroup],
+) -> Result<Rendered> {
+    let mut tags = Vec::new();
+    let mut urls = Vec::new();
+    for planned in groups {
+        let (tag, url) = css_tag(manifest, dirs, opts, planned.jam, &planned.modules)?;
         if let Some(path) = url {
             urls.push(path);
         }
         tags.push(tag);
-        loaded.extend(group.into_iter().map(|m| (m, jam.media.clone())));
     }
     Ok(Rendered {
         html: tags.join("\n"),
@@ -339,31 +449,62 @@ fn dump_css(
     })
 }
 
-fn dump_js(
+/// Plan a js dump: the runtime bootstrap leads exactly once — on the first
+/// js dump with pending jams that has not already delivered `paste` — then
+/// each queued jam's surviving group.
+fn plan_js<'a>(
     manifest: &Manifest,
-    dirs: &OutputDirs,
-    opts: &RenderOptions,
-    pending: &[Jam],
+    pending: &[&'a Jam],
     loaded: &mut HashSet<String>,
-) -> Result<Rendered> {
-    let mut tags = Vec::new();
-    let mut urls = Vec::new();
-
-    // The runtime goes first, exactly once: the first js dump with pending
-    // jams delivers `paste` itself before any module group.
-    if !pending.is_empty() && !loaded.contains("paste") {
+) -> Result<PlannedDump<'a>> {
+    let bootstrap = if !pending.is_empty() && !loaded.contains("paste") {
         let group: Vec<String> = expand(manifest, &["paste".to_string()], AssetType::Js)?
             .into_iter()
             .filter(|m| !loaded.contains(m))
             .collect();
+        loaded.extend(group.iter().cloned());
+        Some(group)
+    } else {
+        None
+    };
 
+    let mut groups = Vec::new();
+    for &jam in pending {
+        let group: Vec<String> = expand(manifest, &jam.js, AssetType::Js)?
+            .into_iter()
+            .filter(|m| !loaded.contains(m))
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        loaded.extend(group.iter().cloned());
+        groups.push(PlannedGroup {
+            jam,
+            modules: group,
+        });
+    }
+
+    Ok(PlannedDump::Js { bootstrap, groups })
+}
+
+fn dump_js(
+    manifest: &Manifest,
+    dirs: &OutputDirs,
+    opts: &RenderOptions,
+    bootstrap: Option<&[String]>,
+    groups: &[PlannedGroup],
+) -> Result<Rendered> {
+    let mut tags = Vec::new();
+    let mut urls = Vec::new();
+
+    if let Some(group) = bootstrap {
         let packages = packages_segment(manifest);
         let config = format!(
             "paste.config({{packagesUrl:'{}{}/{}/'}});",
             opts.cdn_base, opts.base_path, packages
         );
 
-        match inline_content(manifest, dirs, AssetType::Js, true, 0, &group) {
+        match inline_content(manifest, dirs, AssetType::Js, true, 0, group) {
             // The runtime bootstrap always inlines when it can — the config
             // has to run after `paste` exists, so they share one script. The
             // concat separator keeps the config on its own line: a runtime
@@ -401,23 +542,14 @@ fn dump_js(
                 urls.push(path);
             }
         }
-        loaded.extend(group);
     }
 
-    for jam in pending {
-        let group: Vec<String> = expand(manifest, &jam.js, AssetType::Js)?
-            .into_iter()
-            .filter(|m| !loaded.contains(m))
-            .collect();
-        if group.is_empty() {
-            continue;
-        }
-        let (tag, url) = js_tag(manifest, dirs, opts, jam, &group)?;
+    for planned in groups {
+        let (tag, url) = js_tag(manifest, dirs, opts, planned.jam, &planned.modules)?;
         if let Some(path) = url {
             urls.push(path);
         }
         tags.push(tag);
-        loaded.extend(group);
     }
 
     Ok(Rendered {
@@ -1300,6 +1432,26 @@ mod tests {
         manifest
     }
 
+    /// Manifest with the js runtime plus one js and one css module — enough
+    /// for finish tests that need a module of each type pending at once.
+    fn mixed_manifest() -> Manifest {
+        let mut manifest = js_manifest(&[("app", &[])]);
+        manifest
+            .modules
+            .insert("app".to_string(), "js/app.js".to_string());
+        manifest
+            .modules
+            .insert("site".to_string(), "css/site.css".to_string());
+        manifest
+            .modules
+            .insert("paste".to_string(), "js/paste.js".to_string());
+        manifest.assets.insert(
+            "css/site.css".to_string(),
+            asset("/css/site.h.v1.min.css", 1, STAMP, &[]),
+        );
+        manifest
+    }
+
     // ============================================================
     // Renderer
     // ============================================================
@@ -1937,6 +2089,171 @@ mod tests {
         let events = vec![jam(&[], &["a"])];
         assert!(render_all(&manifest, &OutputDirs::under(dir.path()), &opts(), &events).is_err());
         assert!(render_all(&manifest, &OutputDirs::under(dir.path()), &opts(), &[]).is_err());
+    }
+
+    // ============================================================
+    // Finish — the terminal completion check
+    // ============================================================
+
+    fn media_jam(css: &[&str], js: &[&str], media: &str) -> Event {
+        Event::Jam(Jam {
+            css: css.iter().map(|s| s.to_string()).collect(),
+            js: js.iter().map(|s| s.to_string()).collect(),
+            media: Some(media.to_string()),
+            ..Jam::default()
+        })
+    }
+
+    #[test]
+    fn test_finish_errors_when_a_css_jam_is_never_dumped() {
+        // The reported defect: the css dump already ran when the jam lands,
+        // and ending on a js dump used to drop `site` silently.
+        let manifest = mixed_manifest();
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![
+            Event::Dump(AssetType::Css),
+            jam(&["site"], &["app"]),
+            Event::Dump(AssetType::Js),
+            Event::Finish,
+        ];
+        let err =
+            render_all(&manifest, &OutputDirs::under(dir.path()), &opts(), &events).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("css"), "{msg}");
+        assert!(msg.contains("site"), "{msg}");
+        assert!(!msg.contains("app"), "{msg}");
+        assert!(validate_finished(&manifest, &events).is_err());
+    }
+
+    #[test]
+    fn test_finish_errors_when_a_js_jam_is_never_dumped() {
+        let manifest = mixed_manifest();
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![
+            Event::Dump(AssetType::Js),
+            jam(&["site"], &["app"]),
+            Event::Dump(AssetType::Css),
+            Event::Finish,
+        ];
+        let err =
+            render_all(&manifest, &OutputDirs::under(dir.path()), &opts(), &events).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("js"), "{msg}");
+        assert!(msg.contains("app"), "{msg}");
+        assert!(!msg.contains("site"), "{msg}");
+    }
+
+    #[test]
+    fn test_finish_passes_once_every_type_is_dumped() {
+        // A jam can queue both types at once; dumping them across separate
+        // checkpoints and finishing is the healthy flow.
+        let manifest = mixed_manifest();
+        let dir = tempfile::tempdir().unwrap();
+        write_out(dir.path(), "/js/paste.h.v1.min.js", "PASTE_RT");
+        let events = vec![
+            jam(&["site"], &["app"]),
+            Event::Dump(AssetType::Css),
+            Event::Dump(AssetType::Js),
+            Event::Finish,
+        ];
+        let rendered =
+            render_all(&manifest, &OutputDirs::under(dir.path()), &opts(), &events).unwrap();
+        // finish adds no Rendered — one per dump, as before.
+        assert_eq!(rendered.len(), 2);
+        assert!(
+            rendered[0].html.contains("site+v1.0.min.css"),
+            "{:?}",
+            rendered[0].html
+        );
+        assert!(rendered[1].html.contains("app"), "{:?}", rendered[1].html);
+        validate_finished(&manifest, &events).unwrap();
+    }
+
+    #[test]
+    fn test_finish_dedups_by_media_and_bootstrap_counts_paste() {
+        let manifest = mixed_manifest();
+        let dir = tempfile::tempdir().unwrap();
+        write_out(dir.path(), "/js/paste.h.v1.min.js", "PASTE_RT");
+
+        // Re-jamming a stylesheet under the SAME media after its dump is not
+        // outstanding — the tag it wanted was already emitted.
+        let events = vec![
+            jam(&["site"], &[]),
+            Event::Dump(AssetType::Css),
+            jam(&["site"], &[]),
+            Event::Finish,
+        ];
+        validate_finished(&manifest, &events).unwrap();
+
+        // Under a different media it is a different tag — still owed.
+        let events = vec![
+            jam(&["site"], &[]),
+            Event::Dump(AssetType::Css),
+            media_jam(&["site"], &[], "print"),
+            Event::Finish,
+        ];
+        let err = validate_finished(&manifest, &events).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("site"), "{msg}");
+        assert!(msg.contains("print"), "{msg}");
+
+        // The bootstrap already delivered `paste`: re-jamming it and
+        // finishing without another dump is complete.
+        let events = vec![
+            jam(&[], &["app"]),
+            Event::Dump(AssetType::Js),
+            jam(&[], &["paste"]),
+            Event::Finish,
+        ];
+        validate_finished(&manifest, &events).unwrap();
+    }
+
+    #[test]
+    fn test_finish_empty_page_and_position_rules() {
+        let manifest = mixed_manifest();
+        let dir = tempfile::tempdir().unwrap();
+
+        // An empty page finishes trivially.
+        validate_finished(&manifest, &[Event::Finish]).unwrap();
+        assert!(render_all(
+            &manifest,
+            &OutputDirs::under(dir.path()),
+            &opts(),
+            &[Event::Finish]
+        )
+        .unwrap()
+        .is_empty());
+
+        // finish only ends a page — anything after it is an error, and a
+        // dump-terminated list is not finished.
+        for events in [
+            vec![Event::Finish, Event::Dump(AssetType::Js)],
+            vec![
+                jam(&["site"], &[]),
+                Event::Dump(AssetType::Css),
+                Event::Finish,
+                Event::Dump(AssetType::Js),
+            ],
+        ] {
+            assert!(
+                render_all(&manifest, &OutputDirs::under(dir.path()), &opts(), &events).is_err()
+            );
+        }
+        assert!(
+            validate_finished(&manifest, &[Event::Dump(AssetType::Css)]).is_err(),
+            "a dump does not seal the page"
+        );
+        assert!(validate_finished(&manifest, &[]).is_err());
+    }
+
+    #[test]
+    fn test_finish_names_an_unknown_pending_module() {
+        // A jammed module with no manifest asset surfaces as itself, not as
+        // a generic "still pending" — the same error the dump would raise.
+        let manifest = mixed_manifest();
+        let events = vec![jam(&["nosuch"], &[]), Event::Finish];
+        let err = validate_finished(&manifest, &events).unwrap_err();
+        assert!(format!("{err:#}").contains("nosuch"), "{err:#}");
     }
 
     // ============================================================

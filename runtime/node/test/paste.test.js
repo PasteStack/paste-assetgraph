@@ -179,6 +179,134 @@ test('hash-qualified URLs render, serve, redirect, and validate', async () => wi
   assert.doesNotMatch(tags, /-h[0-9a-f]{32}/);
 }));
 
+test('finish seals the page; a jam its type never dumped fails', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  // The css dump already ran when the jam lands: site.theme is queued for
+  // a dump that never comes, and finishing on the js dump must refuse —
+  // not drop the stylesheet silently.
+  page.dumpCss();
+  page.jam({ css: ['site.theme'], js: ['app'] });
+  page.dumpJs();
+  assert.throws(() => page.finish(), (err) => err instanceof PasteError && /site\.theme/.test(err.message));
+
+  // A failed finish leaves the page open: deliver the missing dump, then
+  // finish — and finish again is a no-op.
+  page.dumpCss();
+  assert.equal(page.finish(), '');
+  assert.equal(page.finish(), '');
+
+  // A sealed page accepts no more events.
+  assert.throws(() => page.jam({ js: ['app'] }), (err) => err instanceof PasteError && /finished/.test(err.message));
+  assert.throws(() => page.dumpJs(), (err) => err instanceof PasteError && /finished/.test(err.message));
+}));
+
+test('finishAsync waits for pending dumps and joins concurrent callers', async () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  page.jam({ js: ['app'] });
+  const dump = page.dumpJsAsync();
+  // Neither a sync finish nor a sync dump may overtake the async dump in
+  // flight — the dump would render a list whose marker is not yet delivered.
+  assert.throws(() => page.finish(), (err) => err instanceof PasteError && /finishAsync/.test(err.message));
+  assert.throws(() => page.dumpJs(), (err) => err instanceof PasteError && /in flight/.test(err.message));
+  // Concurrent finishAsync calls share the one in-flight validation, and
+  // the seal already blocks new events before the worker answers.
+  const first = page.finishAsync();
+  const second = page.finishAsync();
+  assert.strictEqual(first, second);
+  assert.throws(() => page.jam({ js: ['app'] }), (err) => err instanceof PasteError && /finished/.test(err.message));
+  assert.throws(() => page.dumpJsAsync(), (err) => err instanceof PasteError && /finished/.test(err.message));
+  assert.equal(await first, '');
+  assert.equal(await dump.then((html) => html.startsWith('<script')), true);
+  // After a successful finish the call resolves immediately.
+  assert.equal(await page.finishAsync(), '');
+}));
+
+test('a failed finish leaves the page open for the missing dump', async () => withTempDir(async (root) => {
+  const out = path.join(root, 'public');
+  write(path.join(out, 'js/paste.h.v1.min.js'), 'PASTE_RT');
+  write(path.join(out, 'js/app.h.v1.min.js'), 'APP');
+  write(path.join(out, 'css/theme.h.v1.min.css'), 'CSS');
+  // The manifest is absent until restored below — the first dump fails in
+  // the library.
+  const manifestPath = path.join(root, 'manifest.json');
+  const paste = createPaste({ manifest: manifestPath, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  page.jam({ css: ['site.theme'], js: ['app'] });
+  const dump = page.dumpJsAsync();
+  const fin = page.finishAsync();
+  await assert.rejects(fin);
+  await assert.rejects(dump);
+
+  // A failed finish is no false seal: the page accepts events again.
+  page.jam({ js: ['app'] });
+
+  // Restore the manifest — the page still owes its undumped modules.
+  write(manifestPath, MANIFEST);
+  await assert.rejects(page.finishAsync(), /site\.theme|app/);
+  page.dumpCss();
+  page.dumpJs();
+  assert.equal(page.finish(), '');
+}));
+
+test('concurrent same-type async dumps render in record order', async () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  page.jam({ js: ['app'] });
+  const first = page.dumpJsAsync();
+  const second = page.dumpJsAsync();
+  const [firstHtml, secondHtml] = await Promise.all([first, second]);
+  // A queued dump replays only its own event prefix: the first delivers
+  // the jammed group, and the second — running after it — sees the group
+  // already delivered and emits nothing.
+  assert.match(firstHtml, /app\+v1\.0/);
+  assert.equal(secondHtml, '');
+  assert.equal(await page.finishAsync(), '');
+}));
+
+test('a failed async dump cannot launder delivery into a concurrent dump', async () => withTempDir(async (root) => {
+  const out = path.join(root, 'public');
+  write(path.join(out, 'js/paste.h.v1.min.js'), 'PASTE_RT');
+  write(path.join(out, 'js/app.h.v1.min.js'), 'APP');
+  write(path.join(out, 'css/theme.h.v1.min.css'), 'CSS');
+  // The manifest is absent until restored below: the first dump fails.
+  const manifestPath = path.join(root, 'manifest.json');
+  const paste = createPaste({ manifest: manifestPath, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  page.jam({ js: ['app'] });
+  const first = page.dumpJsAsync();
+  // Restoring the manifest is registered directly on the first failure,
+  // before the second dump starts — its queued native call must see it.
+  const restored = first.catch((err) => {
+    write(manifestPath, MANIFEST);
+    return err;
+  });
+  const second = page.dumpJsAsync();
+  const secondOutcome = second.then(
+    (html) => ({ ok: true, html }),
+    (error) => ({ ok: false, error })
+  );
+
+  const firstError = await restored;
+  assert.ok(firstError instanceof PasteError);
+  const outcome = await secondOutcome;
+  // The second dump replays only its own event — the failed first dump was
+  // retracted — and renders the group the manifest now resolves. Rejection
+  // or empty markup would both mean the failure leaked into it.
+  assert.equal(outcome.ok, true, outcome.ok ? '' : String(outcome.error));
+  assert.match(outcome.html, /app\+v1\.0/);
+  assert.equal(await page.finishAsync(), '');
+}));
+
 // Compiles `source` with the real compiler and executes both the source and
 // the emitted file in separate vm contexts, returning what each left on
 // `globalThis.check`. PASTE_ASSETGRAPH_TEST_BIN names the compiler binary;

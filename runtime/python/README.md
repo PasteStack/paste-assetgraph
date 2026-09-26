@@ -42,10 +42,20 @@ page = paste.page()
 page.jam(css=["site.theme"], js=["paste.dom"])   # records, returns ""
 page.dump_css()   # markup for all jams so far
 page.dump_js()    # inlined runtime (once) + loader/inline tags
+page.finish()     # validates and seals the page, returns ""
 ```
 
 `jam(css=(), js=(), inline=False, sync=False, media=None)`. A `PastePage` is
 not thread-safe — create one per render.
+
+`finish()` belongs at the end of a full-page render — usable as the last
+line of a Jinja template since it returns `""`. The library verifies every
+jammed module reached a dump of its type (css delivery is tracked per
+`media`), then seals the page: later jams and dumps raise `PasteError`. A
+jam queued after its type's last dump — a css jam below the head's css dump
+— fails finish naming the module instead of dropping it silently; a failed
+finish leaves the page open so the missing dump can be added and finish
+retried. Repeated successful calls return `""`.
 
 ### resolve_library(env=os.environ, package_dir=<package dir>) -> str
 

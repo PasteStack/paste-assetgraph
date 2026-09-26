@@ -40,13 +40,29 @@ page.dumpCss();   // markup for all jams so far
 page.dumpJs();    // inlined runtime (once) + loader/inline tags
 await page.dumpCssAsync();  // the same renders off the event loop
 await page.dumpJsAsync();
+await page.finishAsync();   // validates and seals the page
 ```
 
-Dumps come in sync and async forms over the same event list. The async forms
-and `combo` run on koffi's worker and never block the event loop — use them
-in async handlers and engines. The sync `dumpCss`/`dumpJs` call the library
-in place — for synchronous template engines. A page holds the render's
-mutable event list — create one per render, never share it across requests.
+Dumps come in sync and async forms over the same event list. Async dumps may
+be invoked concurrently — each records its event immediately — while their
+native calls queue per page and run in record order on koffi's worker, so a
+failed dump never leaks its delivery into a concurrent one. They never block
+the event loop — use them in async handlers and engines. The sync
+`dumpCss`/`dumpJs` call the library in place — for synchronous template
+engines — and must not overtake in-flight async work: they throw while an
+async dump or finish is outstanding. A page holds the render's mutable event
+list — create one per render, never share it across requests.
+
+Finish is the completion check after the last dump. `await
+page.finishAsync()` waits for any in-flight async dumps, then the library
+verifies every jammed module was emitted — a jam queued after its type's
+final dump (a css jam below the head's css dump) throws a `PasteError`
+naming the module instead of dropping it silently. The synchronous
+`finish()` does the same check and throws instead of blocking when async
+work is still in flight — use `finishAsync()` there. Once the page is
+finished, jams and dumps throw; both finish forms are idempotent and return
+`''`, and a failed finish leaves the page open so the missing dump can still
+be added and finish retried.
 
 ### `resolveLibrary(env = process.env, dir = <package dir>)`
 

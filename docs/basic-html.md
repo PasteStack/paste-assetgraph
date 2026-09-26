@@ -118,9 +118,14 @@ nothing); `paste:dump css|js` emits the markup for everything jammed so far.
 
 Jam attributes: `css="…"` and `js="…"` take quoted module lists (split on
 commas and whitespace); `inline` and `sync` are valueless flags; `media="…"`
-takes a quoted value. A `paste:jam` after the last `paste:dump` in a file is a
-build error — it would never be emitted — as is any malformed directive; the
-error names the template file and line.
+takes a quoted value. End of file finishes the page: a `paste:jam` after the
+last `paste:dump` in a file is a build error, and so is a jam queued after
+its own type's last dump — a css jam below `<!-- paste:dump css -->` would
+never be emitted, and the completion check fails the build naming the module
+instead of silently dropping it. So css bound for `<head>` must be jammed
+before the head's css dump; completion detects the omission, it cannot move
+the tag back. Any malformed directive is a build error too; the error names
+the template file and line.
 
 After `build`, `public/index.html` contains the same markup a runtime `render`
 call produces: an inlined runtime with `paste.config({packagesUrl:…})`,

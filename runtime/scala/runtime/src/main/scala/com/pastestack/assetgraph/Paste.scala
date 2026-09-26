@@ -81,16 +81,22 @@ object Paste {
     case Js  extends AssetType("js")
   }
 
-  /** An event in a page's render list: a jam, or a dump of one asset type. */
+  /**
+   * An event in a page's render list: a jam, a dump of one asset type, or
+   * the terminal finish — encoded as the bare string `"finish"` — that
+   * seals the page against undumped modules.
+   */
   private[assetgraph] sealed trait Event
   private[assetgraph] final case class JamEvent(jam: Jam) extends Event
   private[assetgraph] final case class DumpEvent(assetType: AssetType) extends Event
+  private[assetgraph] case object FinishEvent extends Event
 
   /** Encode an event list to the library's render JSON: `{"events":[...]}`. */
   private[assetgraph] def encodeEvents(events: Seq[Event]): String =
     JsObject("events" -> JsArray(events.map {
       case JamEvent(jam) => JsObject("jam" -> jam.toJson(Jam.format))
       case DumpEvent(t)  => JsObject("dump" -> JsString(t.wire))
+      case FinishEvent   => JsString("finish")
     }.toVector)).compactPrint
 
   /** Context classloader first, then this jar's. */

@@ -153,6 +153,7 @@ emit the markup — mark them `| safe`.
     {{ page.dump_js() | safe }}
 
     {% block scripts %}{% endblock %}
+    {{ page.finish() }}
 </body>
 </html>
 ```
@@ -175,6 +176,16 @@ emit the markup — mark them `| safe`.
 The dumps emit the real markup: an inlined runtime once per page, exact-group
 loader URLs with `isLoading` marks, `<link>`/inline `<style>` for CSS, and
 threshold-based inline `<script>` groups.
+
+`page.finish()` ends the template: it returns `""`, renders nothing, and
+seals the page after the library verifies every jammed module reached a dump
+— a css jam that lands below the head's css dump raises `PasteError` naming
+the module instead of silently dropping it. Dumps are per type (and per
+`media` for css), so completion is the check that nothing stayed queued; a
+failed finish leaves the page open so the missing dump can be added and
+finish retried. This layout evaluates the body and scripts blocks after the
+head's CSS dump. Declare CSS requirements before that dump; completion
+reports an omission but cannot insert a stylesheet into the head retroactively.
 
 ## Build & Run
 

@@ -230,10 +230,16 @@ fn manifest_from_open_file(
 }
 
 /// Render the event list and return the last dump's HTML — the same bytes
-/// the `render` command prints.
+/// the `render` command prints. An event list ending in `"finish"` is a
+/// completion check instead: it validates that every jammed module was
+/// dumped and returns an empty string, never markup.
 pub fn render(settings: &Settings, events_json: &str) -> Result<String> {
     let manifest = manifest(&settings.manifest)?;
     let request: RenderInput = serde_json::from_str(events_json)?;
+    if matches!(request.events.last(), Some(jam::Event::Finish)) {
+        jam::validate_finished(&manifest, &request.events)?;
+        return Ok(String::new());
+    }
     let options = jam::RenderOptions {
         cdn_base: settings.cdn_base.clone(),
         base_path: settings.base_path.clone(),
@@ -277,7 +283,7 @@ mod tests {
         r#"{
             "version": "42",
             "generated": "2026-01-01T00:00:00Z",
-            "modules": { "paste": "js/paste.js", "app": "js/app.js" },
+            "modules": { "paste": "js/paste.js", "app": "js/app.js", "site": "css/site.css" },
             "assets": {
                 "js/paste.js": {
                     "source": "src/paste.js",
@@ -291,6 +297,15 @@ mod tests {
                 "js/app.js": {
                     "source": "src/app.js",
                     "output": "/js/app.h.v1.min.js",
+                    "hash": "h",
+                    "version": 1,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "dependencies": [],
+                    "history": []
+                },
+                "css/site.css": {
+                    "source": "src/site.css",
+                    "output": "/css/site.h.v1.min.css",
                     "hash": "h",
                     "version": 1,
                     "timestamp": "2026-01-01T00:00:00Z",
@@ -337,6 +352,33 @@ mod tests {
         assert_eq!(
             render(&settings, events).unwrap(),
             rendered.last().unwrap().html
+        );
+    }
+
+    #[test]
+    fn render_with_finish_validates_and_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = fixture(dir.path());
+
+        // A finished page is a completion check, not markup: the events
+        // were validated and the render returns empty.
+        let events = r#"{"events":[{"jam":{"css":["site"],"js":["app"]}},{"dump":"css"},{"dump":"js"},"finish"]}"#;
+        assert_eq!(render(&settings, events).unwrap(), "");
+
+        // A jam no dump emits fails the finish instead of being dropped.
+        let events = r#"{"events":[{"dump":"css"},{"jam":{"css":["site"],"js":["app"]}},{"dump":"js"},"finish"]}"#;
+        let err = render(&settings, events).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("site"), "{msg}");
+
+        // Events after finish — and finish missing entirely — keep the
+        // ordinary event-list errors.
+        let events = r#"{"events":[{"dump":"css"},"finish",{"dump":"js"}]}"#;
+        assert!(render(&settings, events).is_err());
+        let events = r#"{"events":[{"jam":{"js":["app"]}},{"dump":"js"}]}"#;
+        assert!(
+            render(&settings, events).is_ok(),
+            "a bare dump still renders"
         );
     }
 

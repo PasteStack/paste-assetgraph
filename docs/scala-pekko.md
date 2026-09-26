@@ -136,6 +136,7 @@ so render templates on a blocking dispatcher, never the default one.
   <h1>Hello World</h1>
 
   @Html(page.dumpJs())
+  @page.finish()
 </body>
 </html>
 }
@@ -145,6 +146,16 @@ so render templates on a blocking dispatcher, never the default one.
 runtime once, `<link>`/`<style>` for CSS, and `isLoading` loader tags or
 `<script src>` for JS. Groups under `inlineThreshold` (1024 bytes; `0` disables
 automatic inlining) inline automatically; `inline = true` forces it.
+
+`page.finish()` ends the page: it returns `""` and seals it after the library
+verifies every jammed module reached a dump of its type (css delivery is
+tracked per `media`). A jam queued after its type's last dump — a css jam
+below the head's css dump — throws `PasteException` naming the module rather
+than dropping the tag silently, and a failed finish leaves the page open so
+the missing dump can be added and finish retried. Include templates never
+finish — they are partial renders — so finish lives on the root layout (or in
+the host's `renderPage`-style helper, where the layout's own finish makes the
+call idempotent).
 
 ## Build Integration
 

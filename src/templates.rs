@@ -214,7 +214,11 @@ fn render_file(
         );
     }
 
-    let events: Vec<Event> = directives.iter().map(|d| d.event.clone()).collect();
+    let mut events: Vec<Event> = directives.iter().map(|d| d.event.clone()).collect();
+    // EOF seals the page: finish validates that every jammed module was
+    // dumped, so a jam queued after its type's last dump fails the build
+    // instead of silently dropping the modules.
+    events.push(Event::Finish);
     let rendered = jam::render_all(manifest, dirs, opts, &events)
         .with_context(|| format!("{}", path.display()))?;
 
@@ -558,6 +562,53 @@ mod tests {
         // No directive survives.
         assert!(!out.contains("paste:jam"), "{out}");
         assert!(!out.contains("paste:dump"), "{out}");
+    }
+
+    #[test]
+    fn test_render_templates_errors_when_a_late_jam_is_never_dumped() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let manifest = test_manifest();
+        write_compiled(&config, "/js/paste.h.v1.min.js", "PASTE_RT");
+        write_compiled(&config, "/js/app.h.v2.min.js", "APP");
+        write_compiled(&config, "/css/site.h.v1.min.css", ".site{}");
+
+        // The css dump already ran when this jam lands: site is queued for
+        // a css dump that never comes, and ending on a js dump must not
+        // lose it silently.
+        write_template(
+            &config,
+            "index.html",
+            "<!-- paste:dump css -->\n<!-- paste:jam css=\"site\" js=\"app\" -->\n<!-- paste:dump js -->",
+        );
+
+        let err = render_templates(&config, &manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("css"), "{msg}");
+        assert!(msg.contains("site"), "{msg}");
+    }
+
+    #[test]
+    fn test_render_templates_errors_when_a_late_js_jam_is_never_dumped() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let manifest = test_manifest();
+        write_compiled(&config, "/js/paste.h.v1.min.js", "PASTE_RT");
+        write_compiled(&config, "/js/app.h.v2.min.js", "APP");
+        write_compiled(&config, "/css/site.h.v1.min.css", ".site{}");
+
+        // The symmetric case: app is jammed after the js dump and the page
+        // ends on a css dump — the pending js must still fail the build.
+        write_template(
+            &config,
+            "index.html",
+            "<!-- paste:dump js -->\n<!-- paste:jam css=\"site\" js=\"app\" -->\n<!-- paste:dump css -->",
+        );
+
+        let err = render_templates(&config, &manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("js"), "{msg}");
+        assert!(msg.contains("app"), "{msg}");
     }
 
     #[test]

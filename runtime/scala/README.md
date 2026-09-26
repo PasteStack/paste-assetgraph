@@ -66,6 +66,7 @@ dispatcher, never the server's default one.
   @page.jam(css = Seq("site.theme"), js = Seq("paste.dom", "paste.event"))
   @Html(page.dumpCss())
   @Html(page.dumpJs())
+  @page.finish()
 }
 ```
 
@@ -75,6 +76,16 @@ the real markup: an inlined runtime once, exact-group loader URLs, inline
 `<script>`/`<style>` groups under `inlineThreshold` (1024 bytes; `0` disables
 automatic inlining, `inline = true` forces it), `isLoading` marks for pending
 modules.
+
+`page.finish()` belongs on the root layout's last line — it returns `""` and
+seals the page after the library verifies every jammed module reached a dump
+of its type (css delivery is tracked per `media`). A jam queued after its
+type's last dump throws `PasteException` naming the module instead of
+dropping it silently; a failed finish leaves the page open so the missing
+dump can be added and finish retried, and repeated finishes return `""`.
+Include templates never finish — they are partial renders — and a host
+helper that renders a template then calls `page.finish()` is idempotent
+against the layout's own call.
 
 ## Combo route
 

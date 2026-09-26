@@ -76,21 +76,22 @@ bounded manifest cache that reloads when the manifest file changes.
 ## Page rendering
 
 `paste.page()` returns a per-render event list. Dumps come in two forms over
-the same event list: `dumpCssAsync`/`dumpJsAsync` call the library on koffi's
-worker and never block the event loop — use them in async handlers. The
-**synchronous** `dumpCss`/`dumpJs` call the library in place for synchronous
-template engines.
+the same event list: `dumpCssAsync`/`dumpJsAsync` may be invoked concurrently
+— each records its event immediately — while their native calls queue per
+page and run in record order on koffi's worker, never blocking the event
+loop. Use them in async handlers. The **synchronous** `dumpCss`/`dumpJs`
+call the library in place for synchronous template engines; they throw while
+async dump or finish work is outstanding — await it first.
 
 ```js
 app.get('/', async (req, res, next) => {
   try {
     const page = paste.page();
     page.jam({ css: ['site.theme'], js: ['paste.dom', 'paste.ui.heroscroll'] });
-    res.render('home', {
-      title: 'My Site',
-      css: await page.dumpCssAsync(),
-      js: await page.dumpJsAsync(),
-    });
+    const css = await page.dumpCssAsync();
+    const js = await page.dumpJsAsync();
+    await page.finishAsync();   // validates before the response is sent
+    res.render('home', { title: 'My Site', css, js });
   } catch (err) {
     next(err);
   }
@@ -102,6 +103,16 @@ the dumps emit the markup — the inlined runtime once, exact-group loader URLs
 with `isLoading` marks, threshold-based inline groups. Insert them unescaped
 in your template engine of choice (e.g. `<%- css %>` in EJS, `{{{css}}}` in
 Handlebars).
+
+Finish the page after the last dump: `finishAsync()` awaits any in-flight
+async dumps, then the library verifies every jammed module was emitted — a
+jam queued after its type's final dump (a css jam below the head's css dump)
+throws a `PasteError` naming the module rather than dropping it silently. In
+synchronous handlers `finish()` does the same check; it throws instead of
+blocking when async work is still in flight. Both are idempotent — a
+repeated call returns `''` — and a failed finish leaves the page open so the
+missing dump can still be added and finish retried. Delivery is tracked per
+type (and per `media` for css), so jams and dumps of the two types compose.
 
 ## Project Structure
 

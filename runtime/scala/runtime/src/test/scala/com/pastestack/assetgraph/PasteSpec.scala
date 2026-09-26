@@ -72,6 +72,39 @@ class PasteSpec extends AnyFlatSpec with Matchers {
         Paste.DumpEvent(Paste.AssetType.Js)
       ))
       jsTags shouldBe paste.render(eventsJson)
+
+      // A complete page seals cleanly — and isFinished reports it.
+      page.isFinished shouldBe false
+      page.finish() shouldBe ""
+      page.isFinished shouldBe true
+      page.finish() shouldBe ""
+    }
+
+  it should "refuse finish while a jam's type was never dumped, then recover" in
+    withTempDir("paste-finish") { root =>
+      val (manifest, out) = e2eFixture(root)
+      val paste = Paste(Paste.Settings(manifest, out, inlineThreshold = 0))
+      val page = paste.page()
+
+      // The css dump already ran when the jam lands: site.theme is queued
+      // for a dump that never comes, and finishing on the js dump must
+      // refuse — not drop the stylesheet silently.
+      page.dumpCss()
+      page.jam(css = Seq("site.theme"), js = Seq("app"))
+      page.dumpJs()
+      val ex = intercept[PasteException](page.finish())
+      ex.getMessage should include("site.theme")
+
+      // A failed finish leaves the page open: deliver the missing dump,
+      // then finish — and finishing again is a no-op.
+      page.isFinished shouldBe false
+      page.dumpCss()
+      page.finish() shouldBe ""
+      page.isFinished shouldBe true
+
+      // A sealed page accepts no more events.
+      intercept[PasteException](page.jam(js = Seq("app")))
+      intercept[PasteException](page.dumpJs())
     }
 
   it should "serve a versioned combo with a year cache and a 404 with no-cache" in

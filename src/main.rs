@@ -45,7 +45,8 @@ enum Commands {
     },
 
     /// Render JAM tags for a replayed event list (events JSON on stdin,
-    /// the last event's dump HTML on stdout)
+    /// the last event's dump HTML on stdout; a list ending in "finish"
+    /// validates the page and prints nothing)
     Render {
         /// Manifest JSON path
         #[arg(long)]

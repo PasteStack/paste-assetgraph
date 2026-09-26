@@ -6,7 +6,7 @@ JAM is a system for managing JavaScript and CSS module dependencies in web appli
 
 **The Rust library owns all of it.** Tag generation, URL construction, dependency filtering and expansion, rendering, and combo responses are implemented once in `paste-assetgraph` and exposed through a small C ABI:
 
-- `paste_render(settings_json, events_json)` — renders a JSON event list and returns the dump HTML;
+- `paste_render(settings_json, events_json)` — renders a JSON event list and returns the dump HTML; an event list ending in the bare string `"finish"` is a completion check instead — it validates that every jammed module was dumped and returns an empty string;
 - `paste_combo(settings_json, path_and_query)` — resolves a request path (optionally followed by `?query`) to a response (`status`, `contentType`, `cacheControl`, `cacheable`, `location`, `body`).
 
 Both return a JSON envelope — `{"ok": ...}` or `{"error": "<message>"}` — as a heap string the caller releases with `paste_free`. The same logic also backs the `render`/`combo` commands of the `paste-assetgraph` CLI. There is no server in the library: `combo` returns a response description — including a `location` for the canonical-URL redirects below — and the host framework writes the HTTP answer.
@@ -84,7 +84,7 @@ build) rather than emitting a URL that cannot be served.
 
 ## Bootstrap HTML
 
-`render` replays a JSON event list and prints the markup the last `dump` event produces. Input:
+`render` replays a JSON event list and prints the markup the last `dump` event produces. A list ending in the bare string `"finish"` is a completion validation, not a render: the page is checked (every jammed module dumped — see Page Tracking) and `render` prints nothing. Input:
 
 ```json
 {"events": [
@@ -146,9 +146,11 @@ Automatic inlining applies to groups whose joined compiled output is at most `in
 
 A page render is an ordered list of events: `{"jam":{...}}` records a group; `{"dump":"css"|"js"}` renders the markup for all events so far. Modules already emitted by earlier groups are excluded from later ones — state lives in the event list, so any wrapper renders identically by replaying the same events. Each dump re-renders the full list; the last dump's output is what `render` prints.
 
+A page ends with the bare string `"finish"`, which must be the last event and produces no markup. Finish is the completion check: the library replays the same plan the dumps used — pending queues per type, loaded sets with per-media css delivery — and refuses the page if any jammed module was never dumped, naming the asset type and module (and the media for css). A module already delivered under the same media is not outstanding; a failed finish leaves the page open so the missing dump can still be added and finish retried. Ordinary dumps stay partial checkpoints — only finish validates completeness. `render` of a finished list returns `""`.
+
 ### 9. Build-Time Templates
 
-`build` (and every `watch` rebuild) renders HTML templates when `templates.source` is configured: `<!-- paste:jam ... -->` and `<!-- paste:dump css|js -->` directives in `*.html` under the source directory produce the same markup as a runtime `render` call. Rendered pages land under `templates.output`; every referenced combo file and the per-module loader files are materialized under `output.base`. The build fails if `templates.output` equals or nests inside `templates.source`.
+`build` (and every `watch` rebuild) renders HTML templates when `templates.source` is configured: `<!-- paste:jam ... -->` and `<!-- paste:dump css|js -->` directives in `*.html` under the source directory produce the same markup as a runtime `render` call. Rendered pages land under `templates.output`; every referenced combo file and the per-module loader files are materialized under `output.base`. The build fails if `templates.output` equals or nests inside `templates.source`. End of file is the page's finish — a jam queued after its type's last dump fails the build rather than shipping a page that silently lost it, so css for `<head>` must be jammed before the head's css dump; completion detects the omission, it cannot move the tag back.
 
 ### 10. Runtime Configuration
 

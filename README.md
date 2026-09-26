@@ -100,7 +100,10 @@ paste-assetgraph watch --config paste-surface.conf
 
 ### Render page markup
 
-`render` reads a JSON event list on stdin and prints the last dump's markup:
+`render` reads a JSON event list on stdin and prints the last dump's markup.
+A list ending in the bare string `"finish"` is a completion check — every
+jammed module must have reached a dump of its type or the command fails
+naming it — and prints nothing:
 
 ```bash
 echo '{"events":[{"jam":{"css":["site.theme"],"js":["paste.dom"]}},{"dump":"css"},{"dump":"js"}]}' \
@@ -326,6 +329,7 @@ val paste = Paste(Paste.Settings(manifest = Paths.get("public/manifest.json"),
 val page = paste.page()
 page.jam(css = Seq("site.theme"), js = Seq("paste.dom"))
 page.dumpCss(); page.dumpJs()
+page.finish()   // validates every jam reached a dump, returns ""
 ```
 
 ```js
@@ -343,6 +347,7 @@ paste = Paste("public/manifest.json", "public")
 page = paste.page()
 page.jam(css=["site.theme"], js=["paste.dom"])
 page.dump_css(); page.dump_js()
+page.finish()   # validates every jam reached a dump, returns ""
 ```
 
 ## JVM artifacts

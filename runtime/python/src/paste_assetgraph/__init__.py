@@ -210,22 +210,29 @@ class _DumpEvent:
     asset_type: str
 
 
+@dataclass(frozen=True)
+class _FinishEvent:
+    """The terminal finish marker, frozen at record time."""
+
+
 def _encode_events(events: tuple) -> str:
     """Serialize a page's event tuple to the library's render JSON."""
-    return json.dumps({"events": [
-        {
-            "jam": {
-                "css": e.css,
-                "js": e.js,
-                "inline": e.inline,
-                "sync": e.sync,
-                "media": e.media,
+    def encode(e):
+        if isinstance(e, _JamEvent):
+            return {
+                "jam": {
+                    "css": e.css,
+                    "js": e.js,
+                    "inline": e.inline,
+                    "sync": e.sync,
+                    "media": e.media,
+                }
             }
-        }
-        if isinstance(e, _JamEvent)
-        else {"dump": e.asset_type}
-        for e in events
-    ]})
+        if isinstance(e, _DumpEvent):
+            return {"dump": e.asset_type}
+        return "finish"  # _FinishEvent encodes as the bare string
+
+    return json.dumps({"events": [encode(e) for e in events]})
 
 
 class PastePage:
@@ -239,6 +246,12 @@ class PastePage:
     each `dump` renders the full event list so far through the library,
     which is what lets the renderer skip modules an earlier dump already
     delivered.
+
+    `finish` seals the page after the last dump: the library verifies every
+    jammed module was emitted — a jam queued after its type's final dump is
+    a PasteError, not a silently dropped tag — and further jams/dumps
+    raise. A failed `finish` leaves the page open so the caller can add the
+    missing dump and retry.
     """
 
     def __init__(self, paste: Paste):
@@ -246,7 +259,16 @@ class PastePage:
         # The page's single mutable cell: an immutable tuple replaced per event.
         self._events: tuple = ()
 
+    @property
+    def _finished(self) -> bool:
+        return bool(self._events) and isinstance(self._events[-1], _FinishEvent)
+
+    def _require_open(self) -> None:
+        if self._finished:
+            raise PasteError("page is finished — no more jams or dumps")
+
     def jam(self, css=(), js=(), inline=False, sync=False, media=None) -> str:
+        self._require_open()
         self._events = (*self._events, _JamEvent(
             css=tuple(css),
             js=tuple(js),
@@ -262,9 +284,29 @@ class PastePage:
     def dump_js(self) -> str:
         return self._dump("js")
 
+    def finish(self) -> str:
+        """Seal the page: every jammed module must have been dumped.
+
+        Returns "" — usable at the end of a template the way dumps are —
+        and is a no-op on an already-finished page. A failed finish leaves
+        the page open so the missing dump can still be added.
+        """
+        if self._finished:
+            return ""
+        candidate = (*self._events, _FinishEvent())
+        self._paste._render(_encode_events(candidate))
+        # Only a successful validation seals the page.
+        self._events = candidate
+        return ""
+
     def _dump(self, asset_type: str) -> str:
-        self._events = (*self._events, _DumpEvent(asset_type))
-        return self._paste._render(_encode_events(self._events))
+        self._require_open()
+        # Commit the dump event only when the render succeeds — a failed
+        # dump must not count as delivery.
+        candidate = (*self._events, _DumpEvent(asset_type))
+        html = self._paste._render(_encode_events(candidate))
+        self._events = candidate
+        return html
 
 
 __all__ = [

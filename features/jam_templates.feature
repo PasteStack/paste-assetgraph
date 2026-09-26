@@ -34,8 +34,7 @@ Feature: Build-Time Template Rendering
     And "media" takes a quoted value
 
   Scenario: Malformed directives fail the build with file and line
-    Given a template containing "paste:jam bogus", an unquoted attribute value,
-      a valued "inline", or a "paste:dump" without exactly one of css or js
+    Given a template containing "paste:jam bogus", an unquoted attribute value, a valued "inline", or a "paste:dump" without exactly one of css or js
     When I run "paste-assetgraph build"
     Then the build fails naming the template file and line
 
@@ -43,6 +42,55 @@ Feature: Build-Time Template Rendering
     Given a template whose final directive is "paste:jam" with no dump after it
     When I run "paste-assetgraph build"
     Then the build fails — the jam would never be emitted
+
+  Scenario: End of file finishes the page — a stranded css jam fails the build
+    Given "templates/index.html" contains:
+      """
+      <!-- paste:dump css -->
+      <!-- paste:jam css="site.theme" js="paste.dom" -->
+      <!-- paste:dump js -->
+      """
+    When I run "paste-assetgraph build"
+    Then the build fails naming the css module that was never dumped
+    # css bound for the head must be jammed before the head's css dump;
+    # finish detects the omission, it cannot move the tag back
+
+  Scenario: A stranded js jam fails the build the same way
+    Given "templates/index.html" contains:
+      """
+      <!-- paste:dump js -->
+      <!-- paste:jam css="site.theme" js="paste.dom" -->
+      <!-- paste:dump css -->
+      """
+    When I run "paste-assetgraph build"
+    Then the build fails naming the js module that was never dumped
+
+  Scenario: Css delivery is tracked per media attribute
+    Given "templates/index.html" contains:
+      """
+      <!-- paste:jam css="site.theme" media="screen" -->
+      <!-- paste:dump css -->
+      <!-- paste:jam css="site.theme" media="print" -->
+      <!-- paste:dump js -->
+      """
+    When I run "paste-assetgraph build"
+    Then the build fails naming the module and its media attribute
+    # the last directive is a dump, so the EOF finish — not the
+    # trailing-jam guard — reports site.theme under media="print" as
+    # a different tag that never shipped
+
+  Scenario: The same module re-jammed under the same media is not outstanding
+    Given "templates/index.html" contains:
+      """
+      <!-- paste:jam css="site.theme" media="screen" -->
+      <!-- paste:dump css -->
+      <!-- paste:jam css="site.theme" media="screen" -->
+      <!-- paste:dump js -->
+      """
+    When I run "paste-assetgraph build"
+    Then the build succeeds
+    # the delivered (module, media) pair is not outstanding; the js jam
+    # list is empty, so finish validates cleanly
 
   Scenario: Referenced combo files are materialized
     Given a template that renders external group URLs
@@ -52,8 +100,7 @@ Feature: Build-Time Template Rendering
 
   Scenario: Loader files are written for every JS module
     When I run "paste-assetgraph build"
-    Then every manifest module with a JS asset has a file at
-      "{output.base}/{base_path}/{packages-segment}/{module}.js"
+    Then every manifest module with a JS asset has a file at "{output.base}/{base_path}/{packages-segment}/{module}.js"
     And the segment matches the packagesUrl the runtime renders
 
   Scenario: Non-HTML files and directive-free pages pass through

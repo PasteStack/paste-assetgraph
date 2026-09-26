@@ -70,7 +70,9 @@ fn parse_settings(json: &str) -> Result<Settings, String> {
 }
 
 /// Render the event list `events_json` against `settings_json`; the
-/// envelope's `ok` is the last dump's HTML string.
+/// envelope's `ok` is the last dump's HTML string. An event list ending in
+/// `"finish"` is a completion check instead — it validates that every
+/// jammed module was dumped and `ok` is an empty string.
 ///
 /// # Safety
 /// `settings_json` and `events_json` must be null or point to valid
@@ -192,6 +194,29 @@ mod tests {
         }))
         .unwrap();
         assert!(envelope["ok"].as_str().unwrap().contains("app+v1.0"));
+    }
+
+    #[test]
+    fn finish_validates_the_page_and_returns_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = cstring(&fixture(root.path()));
+
+        // A complete page renders no markup at finish — ok is "".
+        let events = cstring(r#"{"events":[{"jam":{"js":["app"]}},{"dump":"js"},"finish"]}"#);
+        let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_render(settings.as_ptr(), events.as_ptr())
+        }))
+        .unwrap();
+        assert_eq!(envelope["ok"], "");
+
+        // A jam no dump emitted fails the finish instead of dropping it.
+        let events = cstring(r#"{"events":[{"dump":"js"},{"jam":{"js":["app"]}},"finish"]}"#);
+        let text = take(unsafe { paste_render(settings.as_ptr(), events.as_ptr()) });
+        let error = serde_json::from_str::<serde_json::Value>(&text).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("app"), "{error}");
     }
 
     #[test]

@@ -79,6 +79,40 @@ class PasteEndToEndTest(unittest.TestCase):
             self.assertIn("(function(d,r){", js_tags)
             self.assertIn("app+v1.0", js_tags)
 
+            # A complete page seals cleanly.
+            self.assertEqual(page.finish(), "")
+            self.assertEqual(page.finish(), "")
+
+    def test_finish_seals_the_page_and_a_late_jam_fails(self):
+        with tempfile.TemporaryDirectory(prefix="paste-py-") as root:
+            manifest, out = e2e_fixture(root)
+            paste = Paste(manifest, out, inline_threshold=0, library=library())
+            page = paste.page()
+
+            # The css dump already ran when the jam lands: site.theme is
+            # queued for a dump that never comes, and finishing on the js
+            # dump must refuse — not drop the stylesheet silently.
+            page.dump_css()
+            page.jam(css=("site.theme",), js=("app",))
+            page.dump_js()
+            with self.assertRaises(PasteError) as raised:
+                page.finish()
+            self.assertIn("site.theme", str(raised.exception))
+
+            # A failed finish leaves the page open: deliver the missing
+            # dump, then finish — and finishing again is a no-op.
+            page.dump_css()
+            self.assertEqual(page.finish(), "")
+            self.assertEqual(page.finish(), "")
+
+            # A sealed page accepts no more events.
+            with self.assertRaises(PasteError) as raised:
+                page.jam(js=("app",))
+            self.assertIn("finished", str(raised.exception))
+            with self.assertRaises(PasteError) as raised:
+                page.dump_js()
+            self.assertIn("finished", str(raised.exception))
+
     def test_combo_passes_through_the_library_response(self):
         with tempfile.TemporaryDirectory(prefix="paste-py-") as root:
             manifest, out = e2e_fixture(root)
