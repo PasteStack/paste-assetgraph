@@ -1,0 +1,18 @@
+[build-system]
+# The SPDX license expression below is only understood by setuptools 77 and newer.
+requires = ["setuptools>=77.0.3", "wheel>=0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paste-assetgraph"
+dynamic = ["version"]
+description = "Thin loader for the paste-assetgraph native library"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# The bundled shared libraries the runtime resolves at run time.
+[tool.setuptools.package-data]
+paste_assetgraph = ["native-lib/manifest.json", "native-lib/*/*"]

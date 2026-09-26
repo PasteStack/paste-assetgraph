@@ -1,0 +1,1 @@
+{"version":"spec","generated":"2026-01-01T00:00:00+00:00","modules":{"app":"js/app.js"},"assets":{"js/app.js":{"source":"src/app.js","output":"/js/app.abc.v1.min.js","hash":"abc","version":1,"timestamp":"2026-01-01T00:00:00+00:00","dependencies":[],"history":[]}},"sorted_deps":{}}

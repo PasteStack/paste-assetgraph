@@ -1,0 +1,23 @@
+{
+  "name": "@pastestack/assetgraph",
+  "version": "0.3.0",
+  "description": "Thin loader for the paste-assetgraph native library",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "Apache-2.0",
+  "files": [
+    "index.js",
+    "native-lib/"
+  ],
+  "dependencies": {
+    "koffi": "2.16.3"
+  }
+}

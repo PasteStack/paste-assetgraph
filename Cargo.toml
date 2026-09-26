@@ -1,6 +1,6 @@
 [package]
 name = "paste-assetgraph"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 # Matches the Rust toolchain baked into the cicd-runner-sbtrustdockertofu image
 # (base-containers entry-rust). Raising this is a runner change, not a job-time install.
@@ -9,6 +9,16 @@ authors = ["PasteStack Contributors"]
 description = "Asset pipeline for PasteStack with auto-versioning and dependency resolution"
 license = "Apache-2.0"
 repository = "https://github.com/PasteStack/paste-assetgraph"
+
+[lib]
+name = "paste_assetgraph"
+path = "src/lib.rs"
+
+# The ffi crate builds the shared library the language runtimes load
+# in-process. The root package stays the default member, so a bare
+# `cargo zigbuild --release --target <musl>` still builds only the CLI.
+[workspace]
+members = ["ffi"]
 
 [dependencies]
 # CLI
@@ -27,21 +37,16 @@ md5 = "0.7"
 # SCSS compilation
 grass = "0.13"
 
-# JS minification - oxc parser + codegen (whitespace-only, faithful AST printer).
-# Replaced minify-js 0.6, which miscompiled constructor `function`s into arrow
-# functions and broke paste.js OOP (`new` -> "e is not a constructor").
+# JS minification - oxc parser + minifier (compress + mangle) + codegen printer.
+# The minifier runs with an ES5 target so it never emits syntax newer than the
+# input. Replaced minify-js 0.6, which miscompiled constructor `function`s into
+# arrow functions and broke paste.js OOP (`new` -> "e is not a constructor").
 # Pinned to the newest release whose MSRV fits rust-version above (0.53+ needs 1.85,
 # 0.134+ needs 1.94); bump together with the runner toolchain.
-oxc = { version = "=0.52.0", features = ["codegen"] }
+oxc = { version = "=0.52.0", features = ["codegen", "minifier"] }
 
 # CSS minification
 lightningcss = "1.0.0-alpha.70"
-
-# Async runtime
-tokio = { version = "1.35", features = ["full"] }
-
-# HTTP server for JAM endpoint
-axum = "0.7"
 
 # Serialization for manifest
 bincode = "1.3"
@@ -61,6 +66,9 @@ thiserror = "1.0"
 
 [dev-dependencies]
 tempfile = "3.9"
+# Forcing file mtimes makes the .bin-vs-JSON freshness tests deterministic
+# across filesystem timestamp granularities.
+filetime = "0.2"
 
 [profile.release]
 lto = true

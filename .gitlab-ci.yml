@@ -38,7 +38,10 @@ lint-rust:
   image: ${CICD_PIPELINES_RUST_IMAGE}
   stage: .pre
   script:
-    - cargo fmt --check
+    - cargo fmt --all --check
+    # The release flow bumps VERSION, Cargo.toml and runtime/node/package.json
+    # together; this line and the runtime/node version test catch a missed one.
+    - test "$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)" = "$(tr -d '[:space:]' < VERSION)"
 
 build-rust:
   extends: [.runs-on-branch-or-tag, .tomshley-cicd-cargo-zigbuild]
@@ -51,6 +54,10 @@ build-rust:
     # is added to RUSTFLAGS, so the Linux and Windows targets are unaffected.
     MACOS_SDK_VERSION: "14.5"
     SDKROOT: "${CI_PROJECT_DIR}/.macos-sdk/MacOSX${MACOS_SDK_VERSION}.sdk"
+    # Shared-library targets for the language runtimes — separate from the
+    # musl CLI targets above.
+    PASTE_LIB_TARGETS: "x86_64-unknown-linux-gnu.2.17 aarch64-unknown-linux-gnu.2.17 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-gnu"
+    PASTE_LIB_ROOT: runtime/native/native-lib
     # The SDK enters the linker path for the published Darwin binaries, so the
     # download is pinned by content, not only by tag: a release asset can be
     # replaced, a tag can be moved, and neither would be visible in a build log.
@@ -94,10 +101,51 @@ build-rust:
       done
       (cd .release-assets && sha256sum -- *) > SHA256SUMS
       cat SHA256SUMS
+    - |
+      # The runtimes load the asset graph in-process from this shared library.
+      # Shared objects must match the host's libc. Build both glibc and musl;
+      # .2.17 pins the glibc floor, while musl libraries link its dynamic libc.
+      rm -rf "${PASTE_LIB_ROOT}"
+      for spec in ${PASTE_LIB_TARGETS}; do
+        target="${spec%.2.17}"
+        rustup target add "${target}"
+        case "${target}" in
+          *-linux-musl)
+            RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static" \
+              cargo zigbuild --locked --release -p paste-assetgraph-ffi --target "${spec}"
+            ;;
+          *)
+            cargo zigbuild --locked --release -p paste-assetgraph-ffi --target "${spec}"
+            ;;
+        esac
+        case "${target}" in
+          x86_64-unknown-linux-gnu)  platform=linux-amd64;    file=libpaste_assetgraph_ffi.so ;;
+          aarch64-unknown-linux-gnu) platform=linux-aarch64;  file=libpaste_assetgraph_ffi.so ;;
+          x86_64-unknown-linux-musl) platform=linux-amd64-musl; file=libpaste_assetgraph_ffi.so ;;
+          aarch64-unknown-linux-musl) platform=linux-aarch64-musl; file=libpaste_assetgraph_ffi.so ;;
+          aarch64-apple-darwin)      platform=darwin-aarch64; file=libpaste_assetgraph_ffi.dylib ;;
+          x86_64-apple-darwin)       platform=darwin-amd64;   file=libpaste_assetgraph_ffi.dylib ;;
+          x86_64-pc-windows-gnu)     platform=windows-amd64;  file=paste_assetgraph_ffi.dll ;;
+          *) echo "no platform mapping for ${target}" >&2; exit 1 ;;
+        esac
+        mkdir -p "${PASTE_LIB_ROOT}/${platform}"
+        cp "target/${target}/release/${file}" "${PASTE_LIB_ROOT}/${platform}/${file}"
+      done
+      NATIVE_ROOT="${PASTE_LIB_ROOT}" python3 - <<'PY'
+      import hashlib, json, os
+      from pathlib import Path
+      root = Path(os.environ["NATIVE_ROOT"])
+      manifest = {p.name: hashlib.sha256(f.read_bytes()).hexdigest()
+                  for p in sorted(d for d in root.iterdir() if d.is_dir())
+                  for f in sorted(p.iterdir())}
+      (root / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
+      PY
+      cat "${PASTE_LIB_ROOT}/manifest.json"
   artifacts:
     paths:
       - target/*/release/paste-assetgraph*
       - runtime/scala/sbt-plugin/src/main/resources/native/
+      - runtime/native/
       - SHA256SUMS
     expire_in: 1 hour
 
@@ -107,7 +155,7 @@ test-rust:
   stage: test
   needs: [build-rust]
   script:
-    - cargo test --locked
+    - cargo test --locked --workspace
 
 build-sbt:
   extends: [.runs-on-branch-or-tag]
@@ -127,12 +175,48 @@ test-sbt:
   extends: [.runs-on-branch-or-tag]
   image: ${CICD_PIPELINES_REGISTRY}/cicd-runner-sbtdockertofu:${CICD_PIPELINES_RUNNER_TAG}
   stage: test
-  needs: [build-sbt]
+  needs: [build-rust, build-sbt]
+  # The runtime specs resolve the bundled library from the build-rust
+  # artifact (runtime/native/ is on the classpath); the sbt-plugin specs
+  # inject their own environment.
   script:
     - cd runtime/scala
     - sbt test
     - cd sbt-plugin
     - sbt test
+
+# The language runtimes load the shared library in-process, so their tests
+# run against the bundled copy from the build-rust artifact.
+test-node:
+  extends: [.runs-on-branch-or-tag]
+  image: node:22.14.0-bookworm
+  stage: test
+  needs: [build-rust]
+  variables:
+    PASTE_ASSETGRAPH_TEST_BIN: "${CI_PROJECT_DIR}/target/x86_64-unknown-linux-musl/release/paste-assetgraph"
+  script:
+    - cp -R runtime/native/native-lib runtime/node/native-lib
+    - cd runtime/node
+    - npm ci
+    - npm test
+
+test-python:
+  extends: [.runs-on-branch-or-tag]
+  image: python:3.13.2-slim
+  stage: test
+  needs: [build-rust]
+  script:
+    - cp -R runtime/native/native-lib runtime/python/src/paste_assetgraph/native-lib
+    - python -m pip install --no-cache-dir ./runtime/python
+    - python -m unittest discover -s runtime/python/tests -v
+
+test-node-musl:
+  extends: [test-node]
+  image: node:22.14.0-alpine
+
+test-python-musl:
+  extends: [test-python]
+  image: python:3.13.2-alpine
 
 # A dist build must produce byte-identical output on every platform, because the
 # manifest and the rollups are committed artifacts consumers diff. The Linux run
@@ -143,6 +227,9 @@ determinism-linux:
   stage: test
   needs: [build-rust]
   script:
+    # The manifest now keeps last-modified stamps; pinning them to the commit
+    # time keeps the committed-bytes comparison platform-independent.
+    - export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
     - target/x86_64-unknown-linux-musl/release/paste-assetgraph build --config "${DETERMINISM_CONFIG}"
     - mkdir -p "${DETERMINISM_REFERENCE}"
     - cp features/dist/manifest.json "${DETERMINISM_REFERENCE}/manifest.json"
@@ -159,6 +246,8 @@ determinism-windows:
   tags: [saas-windows-medium-amd64]
   needs: [build-rust, determinism-linux]
   script:
+    # Same stamp pin as determinism-linux so the rebuilt bytes match.
+    - $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
     - .\target\x86_64-pc-windows-gnu\release\paste-assetgraph.exe build --config $env:DETERMINISM_CONFIG
     - |
       $rebuilt = @{
@@ -176,7 +265,8 @@ determinism-windows:
       }
 
 # Publishing waits for every test that judges the binaries being published —
-# including the cross-platform determinism check, which no later job can undo.
+# the language-runtime tests exercise the binary's render/combo contract, and
+# the cross-platform determinism check is one no later job can undo.
 publish-cli:
   extends: [.tomshley-cicd-publish-cargo]
   rules:
@@ -192,7 +282,7 @@ publish-cli:
     - if: '$CI_COMMIT_BRANCH'
       when: manual
       allow_failure: true
-  needs: [build-rust, test-rust, determinism-linux, determinism-windows]
+  needs: [build-rust, test-rust, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
 
 # The recipe publishes one coordinate — the pinnable {ref-slug}-{sha}. A consumer
 # cannot track a branch by a version that changes every pipeline, so the rolling
@@ -200,7 +290,7 @@ publish-cli:
 # empty and the clean version publishes once, so the second pass is skipped.
 publish-maven:
   extends: [.tomshley-cicd-publish-sbt]
-  needs: [build-rust, test-rust, test-sbt, determinism-linux, determinism-windows]
+  needs: [build-rust, test-rust, test-sbt, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
   variables:
     TOMSHLEY_CICD_PUBLISH_PROJECT_ID: "70289607"
   before_script:
@@ -221,8 +311,28 @@ publish-maven:
         TOMSHLEY_CICD_BUILD_REVISION="${CICD_PUBLISH_ROLLING_TAG}" sbt publish
       fi
 
+# Both publish the runtime package — with its bundled native libraries — to
+# this project's GitLab package registry.
+publish-npm:
+  extends: [.tomshley-cicd-publish-npm]
+  needs: [build-rust, test-rust, test-node, test-node-musl, determinism-linux, determinism-windows]
+  script:
+    - cp -R runtime/native/native-lib runtime/node/native-lib
+    - cd runtime/node
+    - !reference [.tomshley-cicd-publish-npm, script]
+
+publish-python:
+  extends: [.tomshley-cicd-publish-python]
+  needs: [build-rust, test-rust, test-python, test-python-musl, determinism-linux, determinism-windows]
+  variables:
+    TOMSHLEY_CICD_PYPI_PACKAGE: paste-assetgraph
+  script:
+    - cp -R runtime/native/native-lib runtime/python/src/paste_assetgraph/native-lib
+    - cd runtime/python
+    - !reference [.tomshley-cicd-publish-python, script]
+
 release-assets:
   extends: [.tomshley-cicd-release-assets]
-  needs: [build-rust, test-rust, determinism-linux, determinism-windows]
+  needs: [build-rust, test-rust, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
   variables:
     TOMSHLEY_CICD_RELEASE_CHECKSUM_FILE: SHA256SUMS
