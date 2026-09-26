@@ -121,6 +121,8 @@ class VersionTest(unittest.TestCase):
     def test_source_tree_composes_the_version_anew(self):
         # Without a generated BUILD_VERSION the source tree composes from
         # VERSION plus the environment, as before.
+        with open(os.path.join(REPO_ROOT, "VERSION"), encoding="utf-8") as fh:
+            base = fh.read().strip()
         namespace = load_setup_namespace()
         with unittest.mock.patch.dict(
             os.environ,
@@ -131,7 +133,7 @@ class VersionTest(unittest.TestCase):
         ):
             self.assertEqual(
                 namespace["distribution_version"](),
-                "0.2.0.dev0+a.feature.x.abc123",
+                f"{base}.dev0+a.feature.x.abc123",
             )
 
     def test_pyproject_declares_dynamic_version(self):
