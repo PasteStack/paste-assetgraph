@@ -1,3 +1,70 @@
+# paste-assetgraph v0.3.0
+
+**Date:** 2026-09-25
+
+## Changed — breaking
+
+- Asset discovery, dependency ordering, versioned filenames, tag rendering
+  and combo resolution now live in the Rust core. The Scala/Pekko, Node and
+  Python packages are thin in-process adapters that return rendered markup
+  and response descriptions; the embedded HTTP server and its `serve`
+  command are removed. Host frameworks own HTTP.
+- Page APIs: one scoped dump replaces the per-type methods —
+  `dump(AssetType.Css)` in Scala, `dump('css')` in Node and `dump("css")` in
+  Python, plus a no-argument `dump()` that emits the css markup then the js.
+  Node also exposes `dumpAsync(type)`. `dumpCss`, `dumpJs`, `dumpCssAsync`,
+  `dumpJsAsync`, `dump_css` and `dump_js` are removed.
+- Versioned asset URLs carry the content hash by default —
+  `/paste/<stamp>/module+v1.0-h<hash>.min.js`. Set `jam.hash-urls = false`
+  or `pasteAssetGraphHashUrls := false` for the previous `module+v1.0`
+  format. The manifest carries the policy so every adapter agrees, and
+  toggling it preserves versions, hashes and history.
+- Stylesheet sources without `@module` take a path-derived module name like
+  JS sources and join the dependency ordering. A `@module` declaration still
+  wins; a colliding or invalid derived name warns and the file compiles as
+  before.
+- The `source.images` key is removed. Configurations that still contain it
+  load normally in both HOCON and JSON.
+- `withPaste`, `withPasteElements` and `withPasteStack` default to the
+  current released webjars (2.1.0 and 0.4.0).
+
+## Added
+
+- CLI: `render` replays an event list from stdin and prints the last dump's
+  markup, `combo` resolves a combo URL to its response as JSON, `build`
+  gained `--react` and `--cwd`, and `init` scaffolds a configuration.
+- In-process adapters for Scala, Pekko, Node and Python over the bundled
+  native library; the Scala adapter exposes the public `AssetType`.
+- Static template rendering: `<!-- paste:jam ... -->` and
+  `<!-- paste:dump [css|js] -->` comments under `templates.source` render
+  into `templates.output`, and the combo responses and loader files the
+  emitted tags reference are written beside them. A bare
+  `<!-- paste:dump -->` emits both types.
+- Page finish: `finish()` in Scala and Python, and `finish()` /
+  `finishAsync()` in Node, fail a render naming any jammed module that never
+  reached a dump of its type. A failed finish leaves the page open; success
+  seals it and repeats are inert.
+- Configurable discovery: multiple source roots, recursive scanning that
+  skips generated output, and flat or beside-source output layouts.
+- Retained-output integrity: stored files are byte-verified against the
+  manifest and repaired or rebuilt when tampered; version history survives
+  layout changes and source retirement.
+- Manifest caches validate JSON content and binary schema before use; a
+  corrupt manifest or unreadable source fails explicitly.
+- WebJar extraction verifies each entry against its archive checksum. The
+  bundled native binary is extracted per plugin version, and when
+  replacement fails on Windows a checksum-verified existing binary is used.
+- Saving a manifest refuses cross-type output prefixes (a js asset under
+  `/css/` or the reverse).
+
+## Fixed
+
+- Include-path sources without `@module` warn when their name falls back to
+  the path.
+- An absolute manifest path in the generated sbt configuration warns.
+- Array configuration values containing `=` are covered by test.
+- Local-storage writes skip unchanged files, matching the committed-output
+  backend.
 # paste-assetgraph v0.2.0
 
 **Date:** 2026-09-22
