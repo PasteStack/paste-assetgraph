@@ -40,8 +40,9 @@ paste = Paste(
 ```python
 page = paste.page()
 page.jam(css=["site.theme"], js=["paste.dom"])   # records, returns ""
-page.dump_css()   # markup for all jams so far
-page.dump_js()    # inlined runtime (once) + loader/inline tags
+page.dump("css")  # markup for css jams so far
+page.dump("js")   # inlined runtime (once) + loader/inline tags
+page.dump()       # both in one dump — css markup first, then js
 page.finish()     # validates and seals the page, returns ""
 ```
 

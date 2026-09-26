@@ -5,6 +5,7 @@ import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import java.security.{DigestInputStream, MessageDigest}
 import java.util.Locale
 import scala.sys.process._
+import scala.util.control.NonFatal
 import scala.util.{Try, Using}
 import sjsonnew.shaded.scalajson.ast.unsafe.{JField, JObject, JString}
 import sjsonnew.support.scalajson.unsafe.Parser
@@ -89,11 +90,31 @@ object Binary {
       Some(binaryTarget)
     } else {
       Option(getClass.getResourceAsStream(s"/native/$platform/$binaryFileName")).map { input =>
-        val extracted = Using.resource(input)(extract(_, binaryTarget))
-        verifyChecksum(extracted, expected, platform)
+        settle(binaryTarget, expected, {
+          val extracted = Using.resource(input)(extract(_, binaryTarget))
+          verifyChecksum(extracted, expected, platform)
+        })
       }
     }
   }
+
+  /**
+   * On Windows a running .exe cannot be replaced: rewriting `target` fails even
+   * though the file already on disk is the binary this version would write.
+   * When `attempt` throws, keep `target` only if it is an executable file that
+   * still verifies against the checksum manifest; anything else rethrows the
+   * original failure.
+   */
+  private[assetgraph] def settle(target: Path, expected: Option[String], attempt: => Path): Path =
+    try attempt
+    catch {
+      case NonFatal(error) =>
+        if (isExecutableFile(target) && Try(sha256(target)).toOption.exists(expected.contains)) {
+          target
+        } else {
+          throw error
+        }
+    }
 
   private def readResource(input: InputStream): Option[String] =
     Try(new String(input.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)).toOption

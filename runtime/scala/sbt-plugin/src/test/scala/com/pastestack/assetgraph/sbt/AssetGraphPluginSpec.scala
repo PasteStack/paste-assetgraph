@@ -8,6 +8,17 @@ import org.scalatest.funsuite.AnyFunSuite
 import _root_.sbt.{Attributed, IO, Logger}
 
 final class AssetGraphPluginSpec extends AnyFunSuite {
+  /** A BasicLogger that records every message, for asserting on warns. */
+  private final class RecordingLogger extends sbt.internal.util.BasicLogger {
+    val lines = new scala.collection.mutable.ListBuffer[String]
+    override def ansiCodesSupported: Boolean = false
+    def trace(t: => Throwable): Unit = ()
+    def log(level: sbt.Level.Value, message: => String): Unit = lines += message
+    def success(message: => String): Unit = ()
+    def control(event: sbt.util.ControlEvent.Value, message: => String): Unit = ()
+    def logAll(events: Seq[sbt.util.LogEvent]): Unit = events.foreach(e => lines += e.toString)
+  }
+
   private def withDirectory(test: Path => Unit): Unit = {
     val directory = Files.createTempDirectory("assetgraph-webjar-spec")
     try test(directory) finally IO.delete(directory.toFile)
@@ -314,6 +325,9 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
     assert(config.contains("""output.build-dir-name = "_paste_build""""))
     assert(!config.contains("source.js"), config)
     assert(!config.contains("source.scss"), config)
+    // `source.images` was never used by the build — the generated config no
+    // longer carries it.
+    assert(!config.contains("source.images"), config)
     // Hash-qualified URLs default on; the setting feeds the generated file.
     assert(config.contains("jam.hash-urls = true"), config)
   }
@@ -405,6 +419,44 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
       assert(regenerated.contains("""output.layout = "beside-source""""), regenerated)
       assert(!regenerated.contains("stale/dir"), regenerated)
       assert(regenerated.contains("""manifest = "target/resource_managed/paste-assetgraph-manifest.json""""), regenerated)
+    }
+  }
+
+  test("writeGeneratedConfig warns when the manifest path cannot be made relative") {
+    withDirectory { directory =>
+      val base = directory.resolve("base").toFile
+      val configFile = new java.io.File(base, "target/paste-assetgraph-generated.conf")
+      // resourceManaged outside the project base cannot be relativized —
+      // the generated config takes the absolute path and warns about it.
+      val resourceManaged = directory.resolve("elsewhere/resource_managed").toFile
+      val log = new RecordingLogger
+
+      AssetGraphPlugin.writeGeneratedConfig(
+        log,
+        base,
+        configFile,
+        resourceManaged,
+        "",
+        Seq("src/main/web"),
+        "target/public",
+        Seq.empty,
+        minify = true,
+        sourceMaps = true,
+        debug = false,
+        storageBackend = "local",
+        keepVersions = 10,
+        "flat",
+        "_paste_build",
+        Seq.empty
+      )
+
+      val absolute = s"${resourceManaged.getPath}/paste-assetgraph-manifest.json"
+      val generated = new String(Files.readAllBytes(configFile.toPath), UTF_8)
+      assert(generated.contains(s"""manifest = "$absolute""""), generated)
+      assert(
+        log.lines.exists(line => line.contains("absolute") && line.contains("manifest")),
+        log.lines.mkString("\n")
+      )
     }
   }
 

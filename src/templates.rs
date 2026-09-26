@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::config::Config;
-use crate::jam::{self, AssetType, Event, Jam, OutputDirs, RenderOptions};
+use crate::jam::{self, AssetType, DumpScope, Event, Jam, OutputDirs, RenderOptions};
 use crate::manifest::Manifest;
 
 /// Render every `*.html` file under `templates.source` into
@@ -269,7 +269,7 @@ fn parse_directives(content: &str, path: &Path) -> Result<Vec<Directive>> {
 }
 
 /// Parse the body after `paste:` — `jam` with its attributes, or `dump`
-/// with exactly one asset type.
+/// with an asset type — bare `dump` emits both queues.
 fn parse_event(rest: &str, path: &Path, line: usize) -> Result<Event> {
     let rest = rest.trim();
     let (name, args) = match rest.find(char::is_whitespace) {
@@ -279,10 +279,11 @@ fn parse_event(rest: &str, path: &Path, line: usize) -> Result<Event> {
     match name {
         "jam" => parse_jam(args, path, line).map(Event::Jam),
         "dump" => match args.trim() {
-            "css" => Ok(Event::Dump(AssetType::Css)),
-            "js" => Ok(Event::Dump(AssetType::Js)),
+            "" => Ok(Event::Dump(DumpScope::All)),
+            "css" => Ok(Event::Dump(DumpScope::Css)),
+            "js" => Ok(Event::Dump(DumpScope::Js)),
             _ => bail!(
-                "{}:{}: paste:dump takes exactly one of css or js",
+                "{}:{}: paste:dump takes css, js, or nothing",
                 path.display(),
                 line
             ),
@@ -483,7 +484,11 @@ mod tests {
 
         // Whitespace is free around the name and attributes.
         let d = parse_directives("<!--   paste:dump   js  -->", path).unwrap();
-        assert!(matches!(d[0].event, Event::Dump(AssetType::Js)));
+        assert!(matches!(d[0].event, Event::Dump(DumpScope::Js)));
+
+        // A bare dump emits both queues.
+        let d = parse_directives("<!-- paste:dump -->", path).unwrap();
+        assert!(matches!(d[0].event, Event::Dump(DumpScope::All)));
 
         // Ordinary comments are not directives.
         assert!(parse_directives("<!-- hello --><!-- paste2:x -->", path)
@@ -501,9 +506,9 @@ mod tests {
             ("<!-- paste:jam css -->", "double-quoted value"),
             ("<!-- paste:jam inline=\"yes\" -->", "takes no value"),
             ("<!-- paste:jam css=\"a -->", "unterminated"),
-            ("<!-- paste:dump -->", "exactly one of css or js"),
-            ("<!-- paste:dump css js -->", "exactly one of css or js"),
-            ("<!-- paste:dump style -->", "exactly one of css or js"),
+            ("<!-- paste:dump css js -->", "takes css, js, or nothing"),
+            ("<!-- paste:dump style -->", "takes css, js, or nothing"),
+            ("<!-- paste:dump all -->", "takes css, js, or nothing"),
         ] {
             let err = parse_directives(&format!("line1\nline2\n{src}"), path).unwrap_err();
             let msg = err.to_string();
@@ -561,6 +566,45 @@ mod tests {
         );
         // No directive survives.
         assert!(!out.contains("paste:jam"), "{out}");
+        assert!(!out.contains("paste:dump"), "{out}");
+    }
+
+    #[test]
+    fn test_render_templates_bare_dump_emits_both() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let manifest = test_manifest();
+        write_compiled(&config, "/js/paste.h.v1.min.js", "PASTE_RT");
+        write_compiled(&config, "/js/app.h.v2.min.js", "APP");
+        write_compiled(&config, "/css/site.h.v1.min.css", ".site{}");
+
+        // One bare dump stands in for a css dump followed by a js dump.
+        write_template(
+            &config,
+            "index.html",
+            concat!(
+                "<!doctype html>\n<html>\n<head>\n",
+                "<!-- paste:jam css=\"site\" js=\"app\" -->\n<!-- paste:dump -->\n",
+                "</head>\n<body>\n</body>\n</html>\n"
+            ),
+        );
+        render_templates(&config, &manifest).unwrap();
+
+        let out = fs::read_to_string(config.templates.as_ref().unwrap().output.join("index.html"))
+            .unwrap();
+        let link =
+            format!("<link rel=\"stylesheet\" href=\"/paste/{STAMP_EPOCH}/site+v1.0.min.css\"/>");
+        assert!(out.contains(&link), "{out}");
+        assert!(
+            out.contains(&format!(
+                "d('app').isLoading=!0;r('/paste/{STAMP_EPOCH}/app+v2.0.min.js')"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.find("<link").unwrap() < out.find("<script").unwrap(),
+            "css tags lead the combined dump: {out}"
+        );
         assert!(!out.contains("paste:dump"), "{out}");
     }
 

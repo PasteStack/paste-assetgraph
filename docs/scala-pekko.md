@@ -93,7 +93,6 @@ debug-mode = false
 # Each root is walked recursively and classified by extension; one dir may
 # hold .js, .scss and .css together.
 source.dirs = ["src/main/assets/js", "src/main/assets/scss"]
-source.images = "src/main/assets/images"
 
 output.base = "src/main/public"
 output.js = "src/main/public/js"
@@ -130,12 +129,12 @@ so render templates on a blocking dispatcher, never the default one.
   <title>My App</title>
 
   @page.jam(css = Seq("site.theme"), js = Seq("paste.dom", "paste.ui.heroscroll"))
-  @Html(page.dumpCss())
+  @Html(page.dump(AssetType.Css))
 </head>
 <body>
   <h1>Hello World</h1>
 
-  @Html(page.dumpJs())
+  @Html(page.dump(AssetType.Js))
   @page.finish()
 </body>
 </html>
@@ -256,8 +255,8 @@ message.
 page.jam(css: Seq[String] = Nil, js: Seq[String] = Nil,
          inline: Boolean = false, sync: Boolean = false,
          media: Option[String] = None): String   // records the jam, returns ""
-page.dumpCss(): String
-page.dumpJs(): String
+page.dump(assetType: AssetType): String  // AssetType.Css or AssetType.Js
+page.dump(): String                      // both in one dump — css first, then js
 ```
 
 ## PasteComboRoute

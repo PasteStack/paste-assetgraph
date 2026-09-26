@@ -56,19 +56,22 @@ val routes = concat(new PasteComboRoute(paste).route, yourRoutes)
 ## In Twirl Templates
 
 A `PastePage` keeps the ordered jam/dump event list for one page render; each
-`dumpCss`/`dumpJs` re-renders the whole list through the library, so modules
-already delivered stay out of later URLs. Create one per render — it is not
+`dump` re-renders the whole list through the library, so modules already
+delivered stay out of later URLs. Create one per render — it is not
 thread-safe. A dump renders synchronously, so render templates on a blocking
 dispatcher, never the server's default one.
 
 ```scala
 @defining(paste.page()) { page =>
   @page.jam(css = Seq("site.theme"), js = Seq("paste.dom", "paste.event"))
-  @Html(page.dumpCss())
-  @Html(page.dumpJs())
+  @Html(page.dump(AssetType.Css))
+  @Html(page.dump(AssetType.Js))
   @page.finish()
 }
 ```
+
+`page.dump(AssetType.Css)`/`page.dump(AssetType.Js)` dump one type;
+`page.dump()` dumps both in one event — css markup first, then js.
 
 `page.jam(css = …, js = …, inline = false, sync = false, media = None)` records a
 jam and returns `""` so it can sit in the template as a statement. The dumps emit
@@ -114,11 +117,11 @@ removed; their behavior now lives in the Rust library and is reached through
 
 | Removed API | Replacement |
 |---|---|
-| `manifest.jamUrl` / `jamJsUrl` / `jamCssUrl` | `page.jam(...)` + `dumpJs()`/`dumpCss()` emit the tags; the URL lives inside them |
-| `manifest.jamBootstrap*` | `page.jam(js = …)` + `page.dumpJs()` — the runtime inlines itself once per page |
+| `manifest.jamUrl` / `jamJsUrl` / `jamCssUrl` | `page.jam(...)` + `page.dump(AssetType.Js)`/`page.dump(AssetType.Css)` emit the tags; the URL lives inside them |
+| `manifest.jamBootstrap*` | `page.jam(js = …)` + `page.dump(AssetType.Js)` — the runtime inlines itself once per page |
 | `manifest.jamInlineBootstrap*` | same; small groups inline automatically, or pass `inline = true` |
-| `manifest.jamScriptTag*` | `page.jam(js = …)` + `page.dumpJs()` (or `sync = true` for a `src` tag) |
-| `manifest.jamCssBootstrap*` | `page.jam(css = …)` + `page.dumpCss()` |
+| `manifest.jamScriptTag*` | `page.jam(js = …)` + `page.dump(AssetType.Js)` (or `sync = true` for a `src` tag) |
+| `manifest.jamCssBootstrap*` | `page.jam(css = …)` + `page.dump(AssetType.Css)` |
 | `manifest.page()` / `JamPage` | `paste.page()` returns a `PastePage` (per render, not thread-safe) |
 | `PasteComboHandler` | `paste.combo(pathAndQuery)` |
 | old `PasteComboRoute` constructors/factories (`withManifest`, path pairs) | `new PasteComboRoute(paste)` |

@@ -110,9 +110,9 @@ function callAsync(fn, ...args) {
  * A wrapper around the library for one manifest/output pair.
  *
  * Returns a frozen `{ basePath, page(), combo(pathAndQuery) }`. The sync
- * dumps (`dumpCss`/`dumpJs`) call the library in place; the async dumps
- * (`dumpCssAsync`/`dumpJsAsync`) and `combo` run on koffi's worker and never
- * block the event loop. `combo` resolves to a frozen response.
+ * `dump` calls the library in place; `dumpAsync` and `combo` run on koffi's
+ * worker and never block the event loop. `combo` resolves to a frozen
+ * response.
  */
 export function createPaste({
   manifest,
@@ -172,6 +172,17 @@ export function createPaste({
     let finishPromise;
     // The finish marker is the bare string the wire format uses.
     const FINISH = 'finish';
+
+    // No argument dumps every type in one dump; anything else must be
+    // exactly 'css' or 'js'. Rejects before any native call or event
+    // mutation — the name is validated here, never by the library.
+    const dumpScope = (type) => {
+      if (type === undefined) return 'all';
+      if (type === 'css' || type === 'js') return type;
+      throw new PasteError(
+        `dump takes 'css', 'js', or no argument — got ${JSON.stringify(type)}`
+      );
+    };
 
     // The marker seals recording: once it is in the list — in flight or
     // committed — it is the last event and no new event may land.
@@ -261,17 +272,12 @@ export function createPaste({
         });
         return '';
       },
-      dumpCss() {
-        return dump('css');
+      dump(type) {
+        return dump(dumpScope(type));
       },
-      dumpJs() {
-        return dump('js');
-      },
-      dumpCssAsync() {
-        return dumpAsync('css');
-      },
-      dumpJsAsync() {
-        return dumpAsync('js');
+      dumpAsync(type) {
+        const scope = dumpScope(type);
+        return dumpAsync(scope);
       },
       finish() {
         if (pendingDumps.length > 0 || finishPromise) {

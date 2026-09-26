@@ -56,11 +56,11 @@ class PasteSpec extends AnyFlatSpec with Matchers {
 
       page.jam(css = Seq("site.theme"), js = Seq("app")) shouldBe ""
 
-      val cssTag = page.dumpCss()
+      val cssTag = page.dump(AssetType.Css)
       cssTag should include("stylesheet")
       cssTag should include("site.theme+v1.0")
 
-      val jsTags = page.dumpJs()
+      val jsTags = page.dump(AssetType.Js)
       jsTags should startWith("<script type=\"text/javascript\">PASTE_RT")
       jsTags should include("(function(d,r){")
       jsTags should include("app+v1.0")
@@ -68,8 +68,8 @@ class PasteSpec extends AnyFlatSpec with Matchers {
       // Identical to rendering the same event list directly.
       val eventsJson = Paste.encodeEvents(Vector(
         Paste.JamEvent(Jam(css = Seq("site.theme"), js = Seq("app"))),
-        Paste.DumpEvent(Paste.AssetType.Css),
-        Paste.DumpEvent(Paste.AssetType.Js)
+        Paste.DumpEvent(Some(AssetType.Css)),
+        Paste.DumpEvent(Some(AssetType.Js))
       ))
       jsTags shouldBe paste.render(eventsJson)
 
@@ -78,6 +78,22 @@ class PasteSpec extends AnyFlatSpec with Matchers {
       page.finish() shouldBe ""
       page.isFinished shouldBe true
       page.finish() shouldBe ""
+    }
+
+  it should "dump every type in one call, equal to the two typed dumps" in
+    withTempDir("paste-e2e-all") { root =>
+      val (manifest, out) = e2eFixture(root)
+      val paste = Paste(Paste.Settings(manifest, out, inlineThreshold = 0))
+
+      val reference = paste.page()
+      reference.jam(css = Seq("site.theme"), js = Seq("app"))
+      val expected = reference.dump(AssetType.Css) + "\n" + reference.dump(AssetType.Js)
+
+      val page = paste.page()
+      page.jam(css = Seq("site.theme"), js = Seq("app"))
+      page.dump() shouldBe expected
+      page.finish() shouldBe ""
+      page.isFinished shouldBe true
     }
 
   it should "refuse finish while a jam's type was never dumped, then recover" in
@@ -89,22 +105,22 @@ class PasteSpec extends AnyFlatSpec with Matchers {
       // The css dump already ran when the jam lands: site.theme is queued
       // for a dump that never comes, and finishing on the js dump must
       // refuse — not drop the stylesheet silently.
-      page.dumpCss()
+      page.dump(AssetType.Css)
       page.jam(css = Seq("site.theme"), js = Seq("app"))
-      page.dumpJs()
+      page.dump(AssetType.Js)
       val ex = intercept[PasteException](page.finish())
       ex.getMessage should include("site.theme")
 
       // A failed finish leaves the page open: deliver the missing dump,
       // then finish — and finishing again is a no-op.
       page.isFinished shouldBe false
-      page.dumpCss()
+      page.dump(AssetType.Css)
       page.finish() shouldBe ""
       page.isFinished shouldBe true
 
       // A sealed page accepts no more events.
       intercept[PasteException](page.jam(js = Seq("app")))
-      intercept[PasteException](page.dumpJs())
+      intercept[PasteException](page.dump(AssetType.Js))
     }
 
   it should "serve a versioned combo with a year cache and a 404 with no-cache" in
@@ -187,7 +203,7 @@ class PasteSpec extends AnyFlatSpec with Matchers {
       // Render emits the qualified token.
       val page = paste.page()
       page.jam(js = Seq("app"))
-      page.dumpJs() should include(s"app+v1.0-h$appHash")
+      page.dump(AssetType.Js) should include(s"app+v1.0-h$appHash")
 
       // The qualified combo serves 200.
       val qualified = paste.combo(s"/paste/1767225600/app+v1.0-h$appHash.min.js")
@@ -217,7 +233,7 @@ class PasteSpec extends AnyFlatSpec with Matchers {
       optedOut.combo(s"/paste/1767225600/app+v1.0-h$appHash.min.js").status shouldBe 200
       val page2 = optedOut.page()
       page2.jam(js = Seq("app"))
-      val tags = page2.dumpJs()
+      val tags = page2.dump(AssetType.Js)
       tags should include("app+v1.0.min.js")
       tags should not include "-h"
     }
@@ -237,7 +253,7 @@ class PasteSpec extends AnyFlatSpec with Matchers {
       val paste = Paste(Paste.Settings(manifest, out))
       val eventsJson = Paste.encodeEvents(Vector(
         Paste.JamEvent(Jam(js = Seq("ghost"))),
-        Paste.DumpEvent(Paste.AssetType.Js)
+        Paste.DumpEvent(Some(AssetType.Js))
       ))
       val ex = the[PasteException] thrownBy paste.render(eventsJson)
       ex.getMessage should include("ghost")

@@ -129,8 +129,9 @@ so generated files can never re-enter the build as sources.
 #### Rollup composition
 
 Each rollup concatenates every asset of its type in dependency order: a module's
-dependencies are emitted before the module itself, and assets with no declared
-module name (a stylesheet without `@module`) follow in key order. JavaScript
+dependencies are emitted before the module itself, and assets left unnamed — a
+stylesheet whose path-derived name was invalid or already claimed — follow in key
+order. JavaScript
 parts are joined by a newline, an empty statement, and a newline, so a file
 ending in an expression cannot continue into the next file's leading
 parenthesis. Stylesheets are joined by a newline.

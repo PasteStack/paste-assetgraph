@@ -45,7 +45,6 @@ place of the legacy `source.js`/`source.scss` keys):
 debug-mode = false
 
 source.dirs = ["assets/js", "assets/scss"]
-source.images = "assets/images"
 
 output.base = "public"
 output.js = "public/js"
@@ -94,7 +93,9 @@ build's.
 ## HTML Template
 
 Directives are HTML comments. `paste:jam` records a group (it renders to
-nothing); `paste:dump css|js` emits the markup for everything jammed so far.
+nothing); `paste:dump css|js` emits that type's markup for everything
+jammed so far, and a bare `paste:dump` emits both — css then js — in one
+dump.
 
 `templates/index.html`:
 ```html

@@ -32,8 +32,8 @@ pub struct SourcePaths {
     /// Legacy SCSS root — appended after `js` when set. Empty means unset.
     #[serde(default)]
     pub scss: PathBuf,
-    #[serde(default)]
-    pub images: PathBuf,
+    // `source.images` was read but never used; serde ignores it when a
+    // config still carries the key.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,11 +189,6 @@ impl Config {
             if !cfg.source.scss.as_os_str().is_empty() {
                 cfg.source.scss = Self::resolve_path(base_dir, &cfg.source.scss);
             }
-            cfg.source.images = if cfg.source.images.as_os_str().is_empty() {
-                base_dir.join("src/main/assets/images")
-            } else {
-                Self::resolve_path(base_dir, &cfg.source.images)
-            };
             cfg.output.base = Self::resolve_path(base_dir, &cfg.output.base);
             cfg.output.js = Self::resolve_path(base_dir, &cfg.output.js);
             cfg.output.css = Self::resolve_path(base_dir, &cfg.output.css);
@@ -291,9 +286,6 @@ impl Config {
                 scss: get_value("source.scss")?
                     .map(|v| base_dir.join(v))
                     .unwrap_or_default(),
-                images: base_dir.join(
-                    get_value("source.images")?.unwrap_or_else(|| "src/main/assets/images".into()),
-                ),
             },
             output: OutputPaths {
                 base: output_base.clone(),
@@ -479,11 +471,7 @@ impl Config {
             .iter()
             .map(|p| Self::normalize_path(p))
             .collect::<Result<_>>()?;
-        for slot in [
-            &mut self.source.js,
-            &mut self.source.scss,
-            &mut self.source.images,
-        ] {
+        for slot in [&mut self.source.js, &mut self.source.scss] {
             if !slot.as_os_str().is_empty() {
                 *slot = Self::normalize_path(slot)?;
             }
@@ -647,7 +635,6 @@ impl Config {
                 dirs: Vec::new(),
                 js: base_dir.join("src/main/assets/js"),
                 scss: base_dir.join("src/main/assets/scss"),
-                images: base_dir.join("src/main/assets/images"),
             },
             output: OutputPaths {
                 base: base_dir.join("src/main/public"),
@@ -686,7 +673,6 @@ debug-mode = false
 
 source.js = "src"
 source.scss = "src/styles"
-source.images = "public/images"
 
 output.base = "dist"
 output.js = "dist/assets"
@@ -710,7 +696,6 @@ debug-mode = false
 
 source.js = "src/main/assets/js"
 source.scss = "src/main/assets/scss"
-source.images = "src/main/assets/images"
 
 output.base = "src/main/public"
 output.js = "src/main/public/js"
@@ -734,7 +719,6 @@ debug-mode = false
 
 source.js = "assets/js"
 source.scss = "assets/scss"
-source.images = "assets/images"
 
 output.base = "public"
 output.js = "public/js"
@@ -1044,7 +1028,6 @@ source-maps = true
 
 source.scss = "src/main/assets/scss"
 source.js = "src/main/assets/js"
-source.images = "src/main/assets/images"
 output.base = "target/public"
 output.js = "target/public/js"
 output.css = "target/public/css"
@@ -1093,6 +1076,48 @@ jam.hash-urls = true
     // ============================================================
     // HOCON last-value-wins semantics
     // ============================================================
+
+    #[test]
+    fn test_include_path_elements_may_contain_equals_signs() {
+        let config_content = r#"include-paths = ["path=with=equals", "b"]"#;
+        let dir = tempdir().unwrap();
+        let config = Config::parse_hocon(config_content, dir.path()).unwrap();
+        assert_eq!(
+            config.include_paths,
+            vec![dir.path().join("path=with=equals"), dir.path().join("b"),]
+        );
+    }
+
+    #[test]
+    fn test_config_still_loads_when_source_images_is_present() {
+        // `source.images` is no longer a config field, but a config that
+        // still carries the key loads in both parsers.
+        let dir = tempdir().unwrap();
+        let hocon = Config::parse_hocon(
+            r#"
+source.js = "src/js"
+source.scss = "src/scss"
+source.images = "src/images"
+manifest = "public/manifest.json"
+"#,
+            dir.path(),
+        )
+        .unwrap();
+        assert!(hocon.source.js.to_string_lossy().ends_with("src/js"));
+
+        let json_path = dir.path().join("config.json");
+        fs::write(
+            &json_path,
+            r#"{
+                "source": { "js": "src/js", "scss": "src/scss", "images": "src/images" },
+                "output": { "base": "public", "js": "public/js", "css": "public/css", "images": "public/images" },
+                "manifest_path": "public/manifest.json"
+            }"#,
+        )
+        .unwrap();
+        let json = Config::load_with_base_dir(&json_path, dir.path()).unwrap();
+        assert!(json.source.js.to_string_lossy().ends_with("src/js"));
+    }
 
     #[test]
     fn test_config_value_with_equals_sign() {

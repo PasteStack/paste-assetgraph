@@ -63,7 +63,9 @@ impl Settings {
     }
 }
 
-/// stdin shape for `render`: `{"events":[{"jam":{...}},{"dump":"js"}]}`.
+/// stdin shape for `render`: `{"events":[{"jam":{...}},{"dump":"js"}]}`;
+/// the dump scope is `"css"`, `"js"`, or `"all"` — css tags then js tags
+/// in one dump — and a trailing `"finish"` validates the page.
 #[derive(Deserialize)]
 struct RenderInput {
     events: Vec<jam::Event>,
@@ -352,6 +354,21 @@ mod tests {
         assert_eq!(
             render(&settings, events).unwrap(),
             rendered.last().unwrap().html
+        );
+    }
+
+    #[test]
+    fn render_all_scope_returns_one_combined_dump() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = fixture(dir.path());
+        let events = r#"{"events":[{"jam":{"css":["site"],"js":["app"]}},{"dump":"all"}]}"#;
+        let html = render(&settings, events).unwrap();
+        assert!(html.contains("stylesheet"), "{html}");
+        assert!(html.contains("<script"), "{html}");
+        // The css tag leads; both arrive in the one string a page emits.
+        assert!(
+            html.find("<link").unwrap() < html.find("<script").unwrap(),
+            "{html}"
         );
     }
 

@@ -531,6 +531,51 @@ impl AssetGraph {
             });
         }
 
+        // A style without @module still joins the module world: it takes a
+        // path-derived name — the relative path under its root, extension
+        // stripped, separators as dots, exactly like JS — as long as the
+        // name is valid and unclaimed. A name that collides with a declared
+        // module or an earlier derived name, or that is not a module name
+        // at all, warns and leaves the file unnamed: it still compiles
+        // under its path key, just outside the named-module index.
+        for style in &mut styles {
+            if style.module_name.is_some() {
+                continue;
+            }
+            let derived = style
+                .source
+                .path
+                .strip_prefix(&style.source.root)?
+                .with_extension("")
+                .to_string_lossy()
+                .replace(['/', '\\'], ".");
+            if !is_module_name(&derived) {
+                eprintln!(
+                    "Warning: {} has no @module and derives invalid module name {}; leaving it unnamed",
+                    style.source.path.display(),
+                    derived
+                );
+                continue;
+            }
+            if css_deps.contains_key(&derived) {
+                eprintln!(
+                    "Warning: {} derives css module name {} that is already claimed; leaving it unnamed",
+                    style.source.path.display(),
+                    derived
+                );
+                continue;
+            }
+            if !style.source.from_source_dir {
+                eprintln!(
+                    "Warning: {} in an include path has no @module; using path-derived name {}",
+                    style.source.path.display(),
+                    derived
+                );
+            }
+            css_deps.insert(derived.clone(), style.declared.clone());
+            style.module_name = Some(derived);
+        }
+
         // Layer the declared CSS dependencies — the layering consumes the
         // declarations; the stored dependencies are the backfilled list.
         let css_order = layered_order(&css_deps);
@@ -569,6 +614,7 @@ impl AssetGraph {
                 &style.source.path,
                 &style.source.root,
                 style.source.from_source_dir,
+                style.module_name.as_deref(),
                 expanded,
                 &mut manifest,
             )? {
@@ -1022,16 +1068,19 @@ impl AssetGraph {
         let content = fs::read_to_string(path)?;
 
         // Find module name from @module comment
-        let module_name = if let Some(caps) = self.module_re.captures(&content) {
+        let (module_name, derived) = if let Some(caps) = self.module_re.captures(&content) {
             // Convert slash to dot: paste/ui/heroscroll -> paste.ui.heroscroll
-            caps.get(1).unwrap().as_str().replace('/', ".")
+            (caps.get(1).unwrap().as_str().replace('/', "."), false)
         } else {
             // Derive from path (fallback)
-            path.strip_prefix(root)
-                .unwrap_or(path)
-                .with_extension("")
-                .to_string_lossy()
-                .replace(['/', '\\'], ".")
+            (
+                path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .with_extension("")
+                    .to_string_lossy()
+                    .replace(['/', '\\'], "."),
+                true,
+            )
         };
 
         // A name that is not dot-separated word segments could join a
@@ -1048,6 +1097,16 @@ impl AssetGraph {
         // Don't overwrite a module already found in an earlier root
         if self.module_map.contains_key(&module_name) {
             return Ok(());
+        }
+
+        // An include-path file's module name is invisible at a glance —
+        // say when the fallback supplies it.
+        if derived && !from_source_dir {
+            eprintln!(
+                "Warning: {} in an include path has no @module; using path-derived name {}",
+                path.display(),
+                module_name
+            );
         }
 
         // Find dependencies (convert slash to dot)
@@ -1221,24 +1280,21 @@ impl AssetGraph {
 
     /// Process one style file — `.scss` or plain `.css`, which is valid
     /// SCSS — and return its module record for the layering and
-    /// sorted_deps emission that follow the walk. `dependencies` is the
-    /// expanded list the caller computed from the registration map — like
-    /// JS, the version decision sees the full dependency metadata, so a
-    /// transitive-dependency edit still versions the file.
+    /// sorted_deps emission that follow the walk. `module_name` is the
+    /// effective name the registration pass resolved — declared or
+    /// path-derived, `None` when neither applies — and `dependencies` is
+    /// the expanded list the caller computed from the registration map —
+    /// like JS, the version decision sees the full dependency metadata, so
+    /// a transitive-dependency edit still versions the file.
     fn process_scss(
         &self,
         source_path: &Path,
         base_dir: &Path,
         from_source_dir: bool,
+        module_name: Option<&str>,
         dependencies: Vec<String>,
         manifest: &mut Manifest,
     ) -> Result<Option<CssModule>> {
-        let content = fs::read_to_string(source_path)?;
-
-        // The same declaration parse the registration scan ran — the module
-        // name feeds the record and, at the caller, the module map.
-        let (module_name, _declared) = self.style_declarations(&content, source_path)?;
-
         // Compile through grass with every source dir and include path as a
         // load path — an @import may resolve against any of them. Use
         // from_path so grass knows the file's location for relative @import
@@ -1306,10 +1362,10 @@ impl AssetGraph {
         self.storage
             .write_file(&target, output_content.as_bytes())?;
 
-        // Return the module record if @module was found; sorted_deps
+        // Return the module record when the file is named; sorted_deps
         // emission consumes it.
         Ok(module_name.map(|name| CssModule {
-            name,
+            name: name.to_string(),
             output,
             version,
         }))
@@ -2423,6 +2479,169 @@ mod tests {
     }
 
     // ============================================================
+    // Styles without @module take a path-derived module name
+    // ============================================================
+
+    #[test]
+    fn test_unnamed_style_takes_path_derived_module_name() {
+        use tempfile::tempdir;
+
+        // src/scss/site/theme.scss declares nothing: it is named
+        // "site.theme" like a JS file at that path would be, records the
+        // module, and sorts into css sorted_deps.
+        let dir = tempdir().unwrap();
+        let scss_dir = dir.path().join("src/scss/site");
+        fs::create_dir_all(&scss_dir).unwrap();
+        fs::write(
+            scss_dir.join("theme.scss"),
+            "// @requires base\n.t { color: red; }",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/scss/base.scss"),
+            "// @module base\n.b { color: blue; }",
+        )
+        .unwrap();
+
+        let mut graph = AssetGraph::new(dist_config(dir.path(), false));
+        let manifest = graph.build().unwrap();
+
+        assert_eq!(
+            manifest.modules.get("site.theme"),
+            Some(&"css/site/theme.css".to_string())
+        );
+        assert!(manifest.assets.contains_key("css/site/theme.css"));
+        let sorted: Vec<&String> = manifest.sorted_deps["css"]
+            .iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert_eq!(sorted, vec!["base", "site.theme"]);
+        assert_eq!(
+            manifest.assets["css/site/theme.css"].dependencies,
+            vec!["base".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_derived_style_name_loses_to_a_declared_name() {
+        use tempfile::tempdir;
+
+        // declared.scss declares @module theme; theme.scss derives the same
+        // name — the declaration keeps it and the deriving file stays
+        // unnamed but still compiles under its path key.
+        let dir = tempdir().unwrap();
+        let scss_dir = dir.path().join("src/scss");
+        fs::create_dir_all(&scss_dir).unwrap();
+        fs::write(
+            scss_dir.join("declared.scss"),
+            "// @module theme\n.d { color: red; }",
+        )
+        .unwrap();
+        fs::write(scss_dir.join("theme.scss"), ".t { color: blue; }").unwrap();
+
+        let mut graph = AssetGraph::new(dist_config(dir.path(), false));
+        let manifest = graph.build().unwrap();
+
+        assert_eq!(
+            manifest.modules.get("theme"),
+            Some(&"css/declared.css".to_string()),
+            "the declared owner keeps the name"
+        );
+        assert!(manifest.assets.contains_key("css/declared.css"));
+        assert!(
+            manifest.assets.contains_key("css/theme.css"),
+            "the unnamed file still builds under its path key"
+        );
+        let names: Vec<&String> = manifest.modules.keys().collect();
+        assert_eq!(
+            names.iter().filter(|n| ***n == "theme").count(),
+            1,
+            "one owner for the name"
+        );
+    }
+
+    #[test]
+    fn test_invalid_derived_style_name_stays_unnamed_and_builds() {
+        use tempfile::tempdir;
+
+        // A filename that cannot be a module name (a space) warns, leaves
+        // the file unnamed, and does not fail the build.
+        let dir = tempdir().unwrap();
+        let scss_dir = dir.path().join("src/scss");
+        fs::create_dir_all(&scss_dir).unwrap();
+        fs::write(scss_dir.join("in valid.scss"), ".t { color: red; }").unwrap();
+
+        let mut graph = AssetGraph::new(dist_config(dir.path(), false));
+        let manifest = graph.build().unwrap();
+
+        assert!(
+            manifest.assets.contains_key("css/in valid.css"),
+            "the file compiles under its path key"
+        );
+        assert!(
+            manifest
+                .modules
+                .values()
+                .all(|key| key != "css/in valid.css"),
+            "no module name claims the invalid file"
+        );
+    }
+
+    #[test]
+    fn test_include_path_style_derives_a_module_name() {
+        use tempfile::tempdir;
+
+        // A style an include path provides is named from its path like a
+        // source-dir style (the fallback warning fires on stderr).
+        let dir = tempdir().unwrap();
+        let scss_dir = dir.path().join("src/scss");
+        let include_dir = dir.path().join("vendor");
+        fs::create_dir_all(&scss_dir).unwrap();
+        fs::create_dir_all(&include_dir).unwrap();
+        fs::write(
+            scss_dir.join("base.scss"),
+            "// @module base\n.b { color: blue; }",
+        )
+        .unwrap();
+        fs::write(include_dir.join("widget.scss"), ".w { color: red; }").unwrap();
+
+        let mut config = dist_config(dir.path(), false);
+        config.include_paths = vec![include_dir];
+        let mut graph = AssetGraph::new(config);
+        let manifest = graph.build().unwrap();
+
+        assert_eq!(
+            manifest.modules.get("widget"),
+            Some(&"css/widget.css".to_string())
+        );
+        assert!(manifest.assets.contains_key("css/widget.css"));
+    }
+
+    #[test]
+    fn test_include_path_js_derives_a_module_name() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let js_dir = dir.path().join("src/js");
+        let include_dir = dir.path().join("vendor");
+        fs::create_dir_all(&js_dir).unwrap();
+        fs::create_dir_all(&include_dir).unwrap();
+        fs::write(js_dir.join("a.js"), "// @module a\nvar a = 1;").unwrap();
+        fs::write(include_dir.join("widget.js"), "var w = 1;").unwrap();
+
+        let mut config = dist_config(dir.path(), false);
+        config.include_paths = vec![include_dir];
+        let mut graph = AssetGraph::new(config);
+        let manifest = graph.build().unwrap();
+
+        assert_eq!(
+            manifest.modules.get("widget"),
+            Some(&"js/widget.js".to_string())
+        );
+        assert!(manifest.assets.contains_key("js/widget.js"));
+    }
+
+    // ============================================================
     // SCSS files without @module are tracked and not pruned
     // ============================================================
 
@@ -2455,7 +2674,6 @@ mod tests {
                 dirs: vec![],
                 js: js_dir.clone(),
                 scss: dir.path().join("src/scss"),
-                images: dir.path().join("src/images"),
             },
             output: crate::config::OutputPaths {
                 base: dir.path().join("output"),
@@ -2513,7 +2731,6 @@ mod tests {
                 dirs: vec![],
                 js: dir.join("src/js"),
                 scss: dir.join("src/scss"),
-                images: dir.join("src/images"),
             },
             output: crate::config::OutputPaths {
                 base: output.clone(),
@@ -4117,7 +4334,7 @@ storage.backend = "local"
                         js: vec!["app".to_string()],
                         ..Default::default()
                     }),
-                    crate::jam::Event::Dump(crate::jam::AssetType::Js),
+                    crate::jam::Event::Dump(crate::jam::DumpScope::Js),
                 ],
             )
             .is_err(),

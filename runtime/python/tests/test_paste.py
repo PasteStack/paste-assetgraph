@@ -70,11 +70,11 @@ class PasteEndToEndTest(unittest.TestCase):
 
             self.assertEqual(page.jam(css=("site.theme",), js=("app",)), "")
 
-            css_tag = page.dump_css()
+            css_tag = page.dump("css")
             self.assertIn("stylesheet", css_tag)
             self.assertIn("site.theme+v1.0", css_tag)
 
-            js_tags = page.dump_js()
+            js_tags = page.dump("js")
             self.assertTrue(js_tags.startswith('<script type="text/javascript">PASTE_RT'))
             self.assertIn("(function(d,r){", js_tags)
             self.assertIn("app+v1.0", js_tags)
@@ -92,16 +92,16 @@ class PasteEndToEndTest(unittest.TestCase):
             # The css dump already ran when the jam lands: site.theme is
             # queued for a dump that never comes, and finishing on the js
             # dump must refuse — not drop the stylesheet silently.
-            page.dump_css()
+            page.dump("css")
             page.jam(css=("site.theme",), js=("app",))
-            page.dump_js()
+            page.dump("js")
             with self.assertRaises(PasteError) as raised:
                 page.finish()
             self.assertIn("site.theme", str(raised.exception))
 
             # A failed finish leaves the page open: deliver the missing
             # dump, then finish — and finishing again is a no-op.
-            page.dump_css()
+            page.dump("css")
             self.assertEqual(page.finish(), "")
             self.assertEqual(page.finish(), "")
 
@@ -110,7 +110,7 @@ class PasteEndToEndTest(unittest.TestCase):
                 page.jam(js=("app",))
             self.assertIn("finished", str(raised.exception))
             with self.assertRaises(PasteError) as raised:
-                page.dump_js()
+                page.dump("js")
             self.assertIn("finished", str(raised.exception))
 
     def test_combo_passes_through_the_library_response(self):
@@ -180,7 +180,7 @@ class PasteEndToEndTest(unittest.TestCase):
 
             page = paste.page()
             page.jam(js=("app",))
-            self.assertIn(f"app+v1.0-h{app_hash}", page.dump_js())
+            self.assertIn(f"app+v1.0-h{app_hash}", page.dump("js"))
 
             qualified = paste.combo(
                 f"/paste/1767225600/app+v1.0-h{app_hash}.min.js"
@@ -223,7 +223,7 @@ class PasteEndToEndTest(unittest.TestCase):
             )
             page = opted_out.page()
             page.jam(js=("app",))
-            tags = page.dump_js()
+            tags = page.dump("js")
             self.assertIn("app+v1.0.min.js", tags)
             self.assertNotIn("-h", tags)
 
@@ -234,11 +234,42 @@ class PasteEndToEndTest(unittest.TestCase):
             page = paste.page()
             page.jam(js=("ghost",))
             with self.assertRaises(PasteError) as ctx:
-                page.dump_js()
+                page.dump("js")
             self.assertIn("ghost", str(ctx.exception))
 
 
 class PastePageTest(unittest.TestCase):
+    def test_dump_with_no_argument_renders_every_type(self):
+        with tempfile.TemporaryDirectory(prefix="paste-py-") as root:
+            manifest, out = e2e_fixture(root)
+            paste = Paste(manifest, out, inline_threshold=0, library=library())
+
+            reference = paste.page()
+            reference.jam(css=("site.theme",), js=("app",))
+            expected = reference.dump("css") + "\n" + reference.dump("js")
+
+            page = paste.page()
+            page.jam(css=("site.theme",), js=("app",))
+            self.assertEqual(page.dump(), expected)
+            self.assertEqual(page.finish(), "")
+
+    def test_dump_with_a_bad_type_rejects_before_any_native_call(self):
+        with tempfile.TemporaryDirectory(prefix="paste-py-") as root:
+            manifest, out = e2e_fixture(root)
+            paste = Paste(manifest, out, inline_threshold=0, library=library())
+            page = paste.page()
+            page.jam(js=("app",))
+
+            # 'all' is the no-argument spelling; as a value it is invalid.
+            for bad in ("all", "css js", "style", 0):
+                with self.assertRaises(PasteError) as ctx:
+                    page.dump(bad)
+                self.assertIn("dump takes", str(ctx.exception))
+
+            # Nothing was recorded: the jam still dumps and finishes.
+            self.assertIn("app+v1.0", page.dump("js"))
+            self.assertEqual(page.finish(), "")
+
     def test_jam_does_not_alias_caller_lists(self):
         with tempfile.TemporaryDirectory(prefix="paste-py-alias-") as root:
             manifest, out = e2e_fixture(root)
@@ -252,7 +283,7 @@ class PastePageTest(unittest.TestCase):
             modules.clear()
             modules.append("ghost")
 
-            js_tags = page.dump_js()
+            js_tags = page.dump("js")
             self.assertIn("app+v1.0", js_tags)
             self.assertNotIn("ghost", js_tags)
 

@@ -260,9 +260,13 @@ object AssetGraphPlugin extends AutoPlugin {
     val manifestPath = if (configuredManifestPath.nonEmpty) {
       configuredManifestPath
     } else {
-      (resourceManagedDir / "paste-assetgraph-manifest.json").relativeTo(base).map(_.getPath).getOrElse(
+      (resourceManagedDir / "paste-assetgraph-manifest.json").relativeTo(base).map(_.getPath).getOrElse {
+        log.warn(
+          s"manifest path ${resourceManagedDir.getPath}/paste-assetgraph-manifest.json is absolute; " +
+            "it makes the generated config machine-specific"
+        )
         resourceManagedDir.getPath + "/paste-assetgraph-manifest.json"
-      )
+      }
     }
 
     // Log webjar paths for debugging
@@ -315,7 +319,6 @@ object AssetGraphPlugin extends AutoPlugin {
 # Do not edit - configure in build.sbt instead
 
 source.dirs = [$escapedSourceDirs]
-source.images = "src/main/assets/images"
 output.base = "$escapedOutputDir"
 output.js = "$escapedOutputDir/js"
 output.css = "$escapedOutputDir/css"

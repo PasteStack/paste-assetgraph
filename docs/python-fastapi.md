@@ -143,14 +143,14 @@ emit the markup — mark them `| safe`.
 
     {{ page.jam(css=['base.responsive', 'common.ui.heroscroll'],
                 js=['paste.dom', 'paste.event', 'paste.ui.heroscroll']) }}
-    {{ page.dump_css() | safe }}
+    {{ page.dump("css") | safe }}
 
     {% block head %}{% endblock %}
 </head>
 <body>
     {% block content %}{% endblock %}
 
-    {{ page.dump_js() | safe }}
+    {{ page.dump("js") | safe }}
 
     {% block scripts %}{% endblock %}
     {{ page.finish() }}

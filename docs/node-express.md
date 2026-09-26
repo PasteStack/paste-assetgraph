@@ -76,20 +76,21 @@ bounded manifest cache that reloads when the manifest file changes.
 ## Page rendering
 
 `paste.page()` returns a per-render event list. Dumps come in two forms over
-the same event list: `dumpCssAsync`/`dumpJsAsync` may be invoked concurrently
+the same event list: `dumpAsync(type)` may be invoked concurrently
 — each records its event immediately — while their native calls queue per
 page and run in record order on koffi's worker, never blocking the event
-loop. Use them in async handlers. The **synchronous** `dumpCss`/`dumpJs`
-call the library in place for synchronous template engines; they throw while
-async dump or finish work is outstanding — await it first.
+loop. Use them in async handlers. The **synchronous** `dump(type)`
+calls the library in place for synchronous template engines; they throw while
+async dump or finish work is outstanding — await it first. `type` is `'css'`
+or `'js'`; no argument dumps both in one event — css markup first, then js.
 
 ```js
 app.get('/', async (req, res, next) => {
   try {
     const page = paste.page();
     page.jam({ css: ['site.theme'], js: ['paste.dom', 'paste.ui.heroscroll'] });
-    const css = await page.dumpCssAsync();
-    const js = await page.dumpJsAsync();
+    const css = await page.dumpAsync('css');
+    const js = await page.dumpAsync('js');
     await page.finishAsync();   // validates before the response is sent
     res.render('home', { title: 'My Site', css, js });
   } catch (err) {

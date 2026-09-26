@@ -118,41 +118,13 @@ impl StorageBackend {
         filename: &str,   // "app.abc123.v1.min.js"
     ) -> Result<String> {
         match self {
-            StorageBackend::Local { .. } => {
+            StorageBackend::Local { .. } | StorageBackend::Dist { .. } => {
                 let dir = self.resolve_dir(asset_type);
                 let file_path = dir.join(filename);
-                // Create parent directories (filename may contain subdirs, e.g., "paste/dom.v1.min.js")
-                if let Some(parent) = file_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&file_path, content)?;
-                Ok(format!("/{}/{}", asset_type, filename))
-            }
-
-            StorageBackend::Dist { .. } => {
-                let dir = self.resolve_dir(asset_type);
-                let file_path = dir.join(filename);
-
-                // Create parent directories (filename may contain subdirs, e.g., "paste/dom.v1.min.js")
-                if let Some(parent) = file_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-
-                // Write if file doesn't exist, or if existing content differs.
-                // Compare actual bytes, not just length — same-length content
-                // with different bytes must still be written (e.g., hash collision).
-                let should_write = if file_path.exists() {
-                    match fs::read(&file_path) {
-                        Ok(existing) => existing != content,
-                        Err(_) => true,
-                    }
-                } else {
-                    true
-                };
-                if should_write {
-                    fs::write(&file_path, content)?;
-                }
-
+                // Both filesystem backends share the write-if-different
+                // rule: unchanged bytes keep their mtime, different bytes
+                // repair the file.
+                self.write_file(&file_path, content)?;
                 Ok(format!("/{}/{}", asset_type, filename))
             }
 

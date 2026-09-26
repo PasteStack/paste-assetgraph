@@ -75,27 +75,22 @@ object Paste {
   private[assetgraph] def defaultOutputBasePath: String =
     sys.env.getOrElse("PASTE_OUTPUT_PATH", "target/public")
 
-  /** The asset type a dump emits. */
-  private[assetgraph] enum AssetType(val wire: String) {
-    case Css extends AssetType("css")
-    case Js  extends AssetType("js")
-  }
-
   /**
-   * An event in a page's render list: a jam, a dump of one asset type, or
-   * the terminal finish — encoded as the bare string `"finish"` — that
-   * seals the page against undumped modules.
+   * An event in a page's render list: a jam, a dump — `Some(assetType)` for
+   * one asset type, `None` for every type in one dump — or the terminal
+   * finish, encoded as the bare string `"finish"`, that seals the page
+   * against undumped modules.
    */
   private[assetgraph] sealed trait Event
   private[assetgraph] final case class JamEvent(jam: Jam) extends Event
-  private[assetgraph] final case class DumpEvent(assetType: AssetType) extends Event
+  private[assetgraph] final case class DumpEvent(assetType: Option[AssetType]) extends Event
   private[assetgraph] case object FinishEvent extends Event
 
   /** Encode an event list to the library's render JSON: `{"events":[...]}`. */
   private[assetgraph] def encodeEvents(events: Seq[Event]): String =
     JsObject("events" -> JsArray(events.map {
       case JamEvent(jam) => JsObject("jam" -> jam.toJson(Jam.format))
-      case DumpEvent(t)  => JsObject("dump" -> JsString(t.wire))
+      case DumpEvent(t)  => JsObject("dump" -> JsString(t.map(_.wire).getOrElse("all")))
       case FinishEvent   => JsString("finish")
     }.toVector)).compactPrint
 

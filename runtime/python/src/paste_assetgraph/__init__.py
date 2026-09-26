@@ -278,11 +278,19 @@ class PastePage:
         ))
         return ""
 
-    def dump_css(self) -> str:
-        return self._dump("css")
-
-    def dump_js(self) -> str:
-        return self._dump("js")
+    def dump(self, asset_type: Optional[str] = None) -> str:
+        """Dump pending modules: one type for "css"/"js", every type for
+        no argument. Anything else raises PasteError before any native call
+        or event mutation."""
+        if asset_type is None:
+            scope = "all"
+        elif asset_type in ("css", "js"):
+            scope = asset_type
+        else:
+            raise PasteError(
+                f"dump takes 'css', 'js', or no argument — got {asset_type!r}"
+            )
+        return self._dump(scope)
 
     def finish(self) -> str:
         """Seal the page: every jammed module must have been dumped.

@@ -208,7 +208,6 @@ fn cli_build_renders_templates_combo_and_loader_files() {
         concat!(
             "source.js = \"assets/js\"\n",
             "source.scss = \"assets/scss\"\n",
-            "source.images = \"assets/images\"\n",
             "output.base = \"public\"\n",
             "output.js = \"public/js\"\n",
             "output.css = \"public/css\"\n",

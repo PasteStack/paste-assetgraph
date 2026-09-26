@@ -106,11 +106,14 @@ jammed module must have reached a dump of its type or the command fails
 naming it — and prints nothing:
 
 ```bash
-echo '{"events":[{"jam":{"css":["site.theme"],"js":["paste.dom"]}},{"dump":"css"},{"dump":"js"}]}' \
+echo '{"events":[{"jam":{"css":["site.theme"],"js":["paste.dom"]}},{"dump":"all"}]}' \
   | paste-assetgraph render \
       --manifest public/manifest.json \
       --output-base public
 ```
+
+A dump's scope is `"css"`, `"js"`, or `"all"` — the combined scope emits
+the css tags then the js tags in one dump, so a page needs only one.
 
 Flags: `--output-js`, `--output-css` (compiled dirs, default `<output-base>/js|css`),
 `--cdn-base` (URL prefix for emitted tags), `--base-path` (default `/paste`),
@@ -166,6 +169,9 @@ output.js = "src/main/public/js"
 output.css = "src/main/public/css"
 manifest = "src/main/public/manifest.json"
 ```
+
+Quote any value containing `#` or `//`: unquoted, those characters start a
+comment under HOCON's own rule and the rest of the line is dropped.
 
 ### Source discovery
 
@@ -328,7 +334,7 @@ val paste = Paste(Paste.Settings(manifest = Paths.get("public/manifest.json"),
   outputBase = Paths.get("public")))
 val page = paste.page()
 page.jam(css = Seq("site.theme"), js = Seq("paste.dom"))
-page.dumpCss(); page.dumpJs()
+page.dump()     // both types; dump(AssetType.Css)/dump(AssetType.Js) pick one
 page.finish()   // validates every jam reached a dump, returns ""
 ```
 
@@ -346,7 +352,7 @@ from paste_assetgraph import Paste
 paste = Paste("public/manifest.json", "public")
 page = paste.page()
 page.jam(css=["site.theme"], js=["paste.dom"])
-page.dump_css(); page.dump_js()
+page.dump()     # both types; dump("css")/dump("js") pick one
 page.finish()   # validates every jam reached a dump, returns ""
 ```
 

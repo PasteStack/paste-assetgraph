@@ -23,6 +23,17 @@ Feature: Build-Time Template Rendering
     And the js dump is replaced by the runtime and loader markup
     And every other byte of the template is preserved verbatim
 
+  Scenario: A bare dump emits both queues in one dump
+    Given "templates/index.html" contains:
+      """
+      <!-- paste:jam css="site.theme" js="paste.dom" -->
+      <!-- paste:dump -->
+      """
+    When I run "paste-assetgraph build"
+    Then "public/index.html" exists at the same relative path
+    And the single dump is replaced by the stylesheet markup followed by the runtime and loader markup
+    # equivalent to "paste:dump css" then "paste:dump js", in one directive
+
   Scenario: Jam directive attributes
     Given a template line:
       """
@@ -34,7 +45,7 @@ Feature: Build-Time Template Rendering
     And "media" takes a quoted value
 
   Scenario: Malformed directives fail the build with file and line
-    Given a template containing "paste:jam bogus", an unquoted attribute value, a valued "inline", or a "paste:dump" without exactly one of css or js
+    Given a template containing "paste:jam bogus", an unquoted attribute value, a valued "inline", or a "paste:dump" argument other than css or js
     When I run "paste-assetgraph build"
     Then the build fails naming the template file and line
 

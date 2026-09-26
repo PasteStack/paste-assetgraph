@@ -427,12 +427,43 @@ impl Manifest {
         self.generated.clear();
     }
 
+    /// Refuse to persist an asset whose recorded output carries the other
+    /// type's path prefix: `OutputDirs::compiled_file` routes an output
+    /// starting with `js/` or `css/` through that type's output directory,
+    /// so a `js/` asset recorded under `/css/…` would be read from a tree
+    /// the build never wrote. Outputs without a type prefix — beside-source
+    /// layout, nested output roots — resolve under the base and are out of
+    /// scope here.
+    fn validate_output_prefixes(&self) -> Result<()> {
+        for (key, entry) in &self.assets {
+            let Some(kind) = key.split_once('/').map(|(t, _)| t) else {
+                continue;
+            };
+            if !matches!(kind, "js" | "css") {
+                continue;
+            }
+            for output in
+                std::iter::once(&entry.output).chain(entry.history.iter().map(|h| &h.output))
+            {
+                let trimmed = output.trim_start_matches('/');
+                let prefix = trimmed.split('/').next().unwrap_or("");
+                if matches!(prefix, "js" | "css") && prefix != kind {
+                    anyhow::bail!(
+                        "manifest asset {key} records output {output} under the {prefix}/ prefix — a {kind}/ asset resolves through {kind}/ only"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The canonical JSON bytes of this manifest: sorted keys, pretty
     /// printed. `save` writes exactly these bytes and binds the bincode
     /// cache to their digest, so `load` accepts a cache only while it still
     /// describes the JSON on disk — a read-time check, not a guarantee
     /// covering builds that write the pair concurrently.
     fn canonical_json(&self) -> Result<Vec<u8>> {
+        self.validate_output_prefixes()?;
         let mut value = serde_json::to_value(self)?;
         canonicalize_json(&mut value);
         Ok(serde_json::to_string_pretty(&value)?.into_bytes())
@@ -861,6 +892,97 @@ mod tests {
             asset_keys, sorted,
             "object keys must be written in sorted order:\n{json}"
         );
+    }
+
+    #[test]
+    fn test_save_rejects_current_output_under_other_type_prefix() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let mut manifest = Manifest::new();
+        manifest.assets.insert(
+            "js/app.js".to_string(),
+            AssetEntry {
+                source: "src/app.js".to_string(),
+                output: "/css/app.h.v1.min.css".to_string(),
+                hash: "h".to_string(),
+                version: 1,
+                timestamp: String::new(),
+                dependencies: vec![],
+                history: vec![],
+                retired: false,
+            },
+        );
+
+        let err = manifest
+            .save(&dir.path().join("manifest.json"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("js/app.js"),
+            "error must name the offending asset key: {err}"
+        );
+    }
+
+    #[test]
+    fn test_save_rejects_history_output_under_other_type_prefix() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let mut manifest = Manifest::new();
+        manifest.assets.insert(
+            "js/app.js".to_string(),
+            AssetEntry {
+                source: "src/app.js".to_string(),
+                output: "/js/app.h.v2.min.js".to_string(),
+                hash: "h2".to_string(),
+                version: 2,
+                timestamp: String::new(),
+                dependencies: vec![],
+                history: vec![AssetVersion {
+                    hash: "h1".to_string(),
+                    version: 1,
+                    output: "/css/app.h.v1.min.css".to_string(),
+                    timestamp: String::new(),
+                }],
+                retired: false,
+            },
+        );
+
+        let err = manifest
+            .save(&dir.path().join("manifest.json"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("js/app.js"),
+            "error must name the offending asset key: {err}"
+        );
+    }
+
+    #[test]
+    fn test_save_accepts_output_without_type_prefix() {
+        use tempfile::tempdir;
+
+        // Beside-source and nested-root layouts record outputs that carry no
+        // js/ or css/ prefix; they resolve under the base directory and are
+        // not this validation's concern.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let mut manifest = Manifest::new();
+        manifest.assets.insert(
+            "js/app.js".to_string(),
+            AssetEntry {
+                source: "src/app.js".to_string(),
+                output: "src/web/_paste_build/app.h.v1.min.js".to_string(),
+                hash: "h".to_string(),
+                version: 1,
+                timestamp: String::new(),
+                dependencies: vec![],
+                history: vec![],
+                retired: false,
+            },
+        );
+
+        manifest.save(&path).unwrap();
+        assert!(path.exists());
     }
 
     #[test]

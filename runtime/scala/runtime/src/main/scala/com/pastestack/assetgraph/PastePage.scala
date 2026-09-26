@@ -43,9 +43,17 @@ final class PastePage private[assetgraph] (paste: Paste) {
     ""
   }
 
-  def dumpCss(): String = dump(Paste.AssetType.Css)
+  /**
+   * Dump one asset type's pending modules as tags/URLs.
+   */
+  def dump(assetType: AssetType): String = dump(Some(assetType))
 
-  def dumpJs(): String = dump(Paste.AssetType.Js)
+  /**
+   * Dump every asset type's pending modules in one dump — CSS tags first,
+   * then JS — equivalent to `dump(AssetType.Css)` then `dump(AssetType.Js)`
+   * back to back.
+   */
+  def dump(): String = dump(None)
 
   /**
    * Seal the page: the library checks that every jammed module was dumped.
@@ -62,7 +70,7 @@ final class PastePage private[assetgraph] (paste: Paste) {
       ""
     }
 
-  private def dump(assetType: Paste.AssetType): String = {
+  private def dump(assetType: Option[AssetType]): String = {
     requireOpen()
     // Commit the dump event only when the render succeeds — a failed dump
     // must not count as delivery.

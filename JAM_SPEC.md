@@ -89,12 +89,16 @@ build) rather than emitting a URL that cannot be served.
 ```json
 {"events": [
   {"jam": {"css": ["site.theme"], "js": ["paste.dom", "paste.event"]}},
-  {"dump": "css"},
-  {"dump": "js"}
+  {"dump": "all"}
 ]}
 ```
 
-Output for the first `js` dump (the `paste` runtime module is inlined ahead of it, once):
+A dump's scope is `"css"`, `"js"`, or `"all"`. The `all` scope drains both
+queues in one dump — the css tags, a newline, then the js tags — producing
+exactly what a `"css"` dump followed by a `"js"` dump would render, as one
+`dump` event.
+
+Output for the `js` part (the `paste` runtime module is inlined ahead of it, once):
 
 ```html
 <script type="text/javascript">…paste runtime source…
@@ -144,13 +148,13 @@ Automatic inlining applies to groups whose joined compiled output is at most `in
 
 ### 8. Page Tracking via Event Replay
 
-A page render is an ordered list of events: `{"jam":{...}}` records a group; `{"dump":"css"|"js"}` renders the markup for all events so far. Modules already emitted by earlier groups are excluded from later ones — state lives in the event list, so any wrapper renders identically by replaying the same events. Each dump re-renders the full list; the last dump's output is what `render` prints.
+A page render is an ordered list of events: `{"jam":{...}}` records a group; `{"dump":"css"|"js"|"all"}` renders the markup for all events so far — `all` delivers both queues, css first, against the same loaded state as separate dumps. Modules already emitted by earlier groups are excluded from later ones — state lives in the event list, so any wrapper renders identically by replaying the same events. Each dump re-renders the full list; the last dump's output is what `render` prints.
 
 A page ends with the bare string `"finish"`, which must be the last event and produces no markup. Finish is the completion check: the library replays the same plan the dumps used — pending queues per type, loaded sets with per-media css delivery — and refuses the page if any jammed module was never dumped, naming the asset type and module (and the media for css). A module already delivered under the same media is not outstanding; a failed finish leaves the page open so the missing dump can still be added and finish retried. Ordinary dumps stay partial checkpoints — only finish validates completeness. `render` of a finished list returns `""`.
 
 ### 9. Build-Time Templates
 
-`build` (and every `watch` rebuild) renders HTML templates when `templates.source` is configured: `<!-- paste:jam ... -->` and `<!-- paste:dump css|js -->` directives in `*.html` under the source directory produce the same markup as a runtime `render` call. Rendered pages land under `templates.output`; every referenced combo file and the per-module loader files are materialized under `output.base`. The build fails if `templates.output` equals or nests inside `templates.source`. End of file is the page's finish — a jam queued after its type's last dump fails the build rather than shipping a page that silently lost it, so css for `<head>` must be jammed before the head's css dump; completion detects the omission, it cannot move the tag back.
+`build` (and every `watch` rebuild) renders HTML templates when `templates.source` is configured: `<!-- paste:jam ... -->` and `<!-- paste:dump css|js -->` directives in `*.html` under the source directory produce the same markup as a runtime `render` call; a bare `<!-- paste:dump -->` is the combined `all` dump. Rendered pages land under `templates.output`; every referenced combo file and the per-module loader files are materialized under `output.base`. The build fails if `templates.output` equals or nests inside `templates.source`. End of file is the page's finish — a jam queued after its type's last dump fails the build rather than shipping a page that silently lost it, so css for `<head>` must be jammed before the head's css dump; completion detects the omission, it cannot move the tag back.
 
 ### 10. Runtime Configuration
 

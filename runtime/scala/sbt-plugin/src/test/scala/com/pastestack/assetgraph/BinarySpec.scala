@@ -114,6 +114,48 @@ final class BinarySpec extends AnyFunSuite with BeforeAndAfterEach {
     assert(Files.readAllBytes(first).toSeq == bundled.toSeq, "the bundled bytes should be restored")
   }
 
+  test("settle keeps the on-disk binary when replacement fails and it still verifies") {
+    val target = Files.createTempDirectory("paste-assetgraph-binary-spec")
+    System.setProperty("paste.assetgraph.version", "0.1.0-develop-a1b2c3d")
+    val binary = Binary.extractBundled(target).get
+    val failure = new java.io.IOException("cannot replace a running binary")
+
+    // A Windows host refuses to overwrite a running .exe; the bytes already
+    // in place are the ones this version would write, so they stand.
+    val result = Binary.settle(binary, Some(digest(binary)), throw failure)
+
+    assert(result == binary)
+  }
+
+  test("settle rethrows the replacement failure when the on-disk binary does not verify") {
+    val binary = Files.createTempFile("paste-assetgraph-settle-mismatch", ".bin")
+    Files.write(binary, "other".getBytes("UTF-8"))
+    binary.toFile.setExecutable(true)
+    val failure = new java.io.IOException("cannot replace a running binary")
+
+    val thrown = intercept[java.io.IOException] {
+      Binary.settle(binary, Some("0" * 64), throw failure)
+    }
+    assert(thrown eq failure)
+  }
+
+  test("settle rethrows the replacement failure when no binary is on disk") {
+    val missing = Files.createTempDirectory("paste-assetgraph-settle-missing").resolve(Binary.BinaryName)
+    val failure = new java.io.IOException("cannot replace a running binary")
+
+    val thrown = intercept[java.io.IOException] {
+      Binary.settle(missing, Some("0" * 64), throw failure)
+    }
+    assert(thrown eq failure)
+  }
+
+  test("settle returns the replacement when the attempt succeeds") {
+    val replacement = Files.createTempFile("paste-assetgraph-settle-ok", ".bin")
+    val unused = replacement.resolveSibling("paste-assetgraph-old")
+
+    assert(Binary.settle(unused, Some("0" * 64), replacement) == replacement)
+  }
+
   test("an executable PASTE_ASSETGRAPH_BIN override wins") {
     val binary = Files.createTempFile("paste-assetgraph-override", ".bin")
     binary.toFile.setExecutable(true)
@@ -185,6 +227,12 @@ final class BinarySpec extends AnyFunSuite with BeforeAndAfterEach {
     }
 
     assert(error.getMessage.contains("<missing>"))
+  }
+
+  private def digest(path: Path): String = {
+    val md = java.security.MessageDigest.getInstance("SHA-256")
+    md.update(Files.readAllBytes(path))
+    md.digest().map(byte => f"${byte & 0xff}%02x").mkString
   }
 
   private def expectedBinary(target: Path, version: String): Path =

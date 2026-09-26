@@ -66,14 +66,64 @@ test('page renders end-to-end through the library', () => withTempDir((root) => 
 
   assert.equal(page.jam({ css: ['site.theme'], js: ['app'] }), '');
 
-  const cssTag = page.dumpCss();
+  const cssTag = page.dump('css');
   assert.match(cssTag, /stylesheet/);
   assert.match(cssTag, /site\.theme\+v1\.0/);
 
-  const jsTags = page.dumpJs();
+  const jsTags = page.dump('js');
   assert.match(jsTags, /^<script type="text\/javascript">PASTE_RT/);
   assert.match(jsTags, /\(function\(d,r\)\{/);
   assert.match(jsTags, /app\+v1\.0/);
+}));
+
+test('a no-argument dump renders every type, equal to the two typed dumps', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+
+  const reference = paste.page();
+  reference.jam({ css: ['site.theme'], js: ['app'] });
+  const expected = `${reference.dump('css')}\n${reference.dump('js')}`;
+
+  const page = paste.page();
+  page.jam({ css: ['site.theme'], js: ['app'] });
+  assert.equal(page.dump(), expected);
+  assert.equal(page.finish(), '');
+}));
+
+test('a dump with a bad type rejects before any native call', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+  page.jam({ js: ['app'] });
+
+  // 'all' is the no-argument spelling; as a value it is not a valid type.
+  for (const bad of ['all', 'css js', 'style', 0, null]) {
+    assert.throws(
+      () => page.dump(bad),
+      (err) => err instanceof PasteError && /dump takes/.test(err.message)
+    );
+    assert.throws(
+      () => page.dumpAsync(bad),
+      (err) => err instanceof PasteError && /dump takes/.test(err.message)
+    );
+  }
+
+  // Nothing was recorded: the jam still dumps and the page finishes.
+  assert.match(page.dump('js'), /app\+v1\.0/);
+  assert.equal(page.finish(), '');
+}));
+
+test('a no-argument async dump renders every type', async () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+  page.jam({ css: ['site.theme'], js: ['app'] });
+
+  const html = await page.dumpAsync();
+  assert.match(html, /stylesheet/);
+  assert.match(html, /site\.theme\+v1\.0/);
+  assert.match(html, /app\+v1\.0/);
+  assert.equal(await page.finishAsync(), '');
 }));
 
 test('combo passes through the library response, frozen', async () => withTempDir(async (root) => {
@@ -139,7 +189,7 @@ test('hash-qualified URLs render, serve, redirect, and validate', async () => wi
   // Render emits the qualified token.
   const page = paste.page();
   page.jam({ js: ['app'] });
-  assert.match(page.dumpJs(), new RegExp(`app\\+v1\\.0-h${appHash}`));
+  assert.match(page.dump('js'), new RegExp(`app\\+v1\\.0-h${appHash}`));
 
   // The qualified combo serves 200.
   const qualified = await paste.combo(`/paste/1767225600/app+v1.0-h${appHash}.min.js`);
@@ -174,7 +224,7 @@ test('hash-qualified URLs render, serve, redirect, and validate', async () => wi
   assert.equal(stillQualified.status, 200);
   const page2 = optedOut.page();
   page2.jam({ js: ['app'] });
-  const tags = page2.dumpJs();
+  const tags = page2.dump('js');
   assert.match(tags, /app\+v1\.0\.min\.js/);
   assert.doesNotMatch(tags, /-h[0-9a-f]{32}/);
 }));
@@ -187,20 +237,20 @@ test('finish seals the page; a jam its type never dumped fails', () => withTempD
   // The css dump already ran when the jam lands: site.theme is queued for
   // a dump that never comes, and finishing on the js dump must refuse —
   // not drop the stylesheet silently.
-  page.dumpCss();
+  page.dump('css');
   page.jam({ css: ['site.theme'], js: ['app'] });
-  page.dumpJs();
+  page.dump('js');
   assert.throws(() => page.finish(), (err) => err instanceof PasteError && /site\.theme/.test(err.message));
 
   // A failed finish leaves the page open: deliver the missing dump, then
   // finish — and finish again is a no-op.
-  page.dumpCss();
+  page.dump('css');
   assert.equal(page.finish(), '');
   assert.equal(page.finish(), '');
 
   // A sealed page accepts no more events.
   assert.throws(() => page.jam({ js: ['app'] }), (err) => err instanceof PasteError && /finished/.test(err.message));
-  assert.throws(() => page.dumpJs(), (err) => err instanceof PasteError && /finished/.test(err.message));
+  assert.throws(() => page.dump('js'), (err) => err instanceof PasteError && /finished/.test(err.message));
 }));
 
 test('finishAsync waits for pending dumps and joins concurrent callers', async () => withTempDir(async (root) => {
@@ -209,18 +259,18 @@ test('finishAsync waits for pending dumps and joins concurrent callers', async (
   const page = paste.page();
 
   page.jam({ js: ['app'] });
-  const dump = page.dumpJsAsync();
+  const dump = page.dumpAsync('js');
   // Neither a sync finish nor a sync dump may overtake the async dump in
   // flight — the dump would render a list whose marker is not yet delivered.
   assert.throws(() => page.finish(), (err) => err instanceof PasteError && /finishAsync/.test(err.message));
-  assert.throws(() => page.dumpJs(), (err) => err instanceof PasteError && /in flight/.test(err.message));
+  assert.throws(() => page.dump('js'), (err) => err instanceof PasteError && /in flight/.test(err.message));
   // Concurrent finishAsync calls share the one in-flight validation, and
   // the seal already blocks new events before the worker answers.
   const first = page.finishAsync();
   const second = page.finishAsync();
   assert.strictEqual(first, second);
   assert.throws(() => page.jam({ js: ['app'] }), (err) => err instanceof PasteError && /finished/.test(err.message));
-  assert.throws(() => page.dumpJsAsync(), (err) => err instanceof PasteError && /finished/.test(err.message));
+  assert.throws(() => page.dumpAsync('js'), (err) => err instanceof PasteError && /finished/.test(err.message));
   assert.equal(await first, '');
   assert.equal(await dump.then((html) => html.startsWith('<script')), true);
   // After a successful finish the call resolves immediately.
@@ -239,7 +289,7 @@ test('a failed finish leaves the page open for the missing dump', async () => wi
   const page = paste.page();
 
   page.jam({ css: ['site.theme'], js: ['app'] });
-  const dump = page.dumpJsAsync();
+  const dump = page.dumpAsync('js');
   const fin = page.finishAsync();
   await assert.rejects(fin);
   await assert.rejects(dump);
@@ -250,8 +300,8 @@ test('a failed finish leaves the page open for the missing dump', async () => wi
   // Restore the manifest — the page still owes its undumped modules.
   write(manifestPath, MANIFEST);
   await assert.rejects(page.finishAsync(), /site\.theme|app/);
-  page.dumpCss();
-  page.dumpJs();
+  page.dump('css');
+  page.dump('js');
   assert.equal(page.finish(), '');
 }));
 
@@ -261,8 +311,8 @@ test('concurrent same-type async dumps render in record order', async () => with
   const page = paste.page();
 
   page.jam({ js: ['app'] });
-  const first = page.dumpJsAsync();
-  const second = page.dumpJsAsync();
+  const first = page.dumpAsync('js');
+  const second = page.dumpAsync('js');
   const [firstHtml, secondHtml] = await Promise.all([first, second]);
   // A queued dump replays only its own event prefix: the first delivers
   // the jammed group, and the second — running after it — sees the group
@@ -283,14 +333,14 @@ test('a failed async dump cannot launder delivery into a concurrent dump', async
   const page = paste.page();
 
   page.jam({ js: ['app'] });
-  const first = page.dumpJsAsync();
+  const first = page.dumpAsync('js');
   // Restoring the manifest is registered directly on the first failure,
   // before the second dump starts — its queued native call must see it.
   const restored = first.catch((err) => {
     write(manifestPath, MANIFEST);
     return err;
   });
-  const second = page.dumpJsAsync();
+  const second = page.dumpAsync('js');
   const secondOutcome = second.then(
     (html) => ({ ok: true, html }),
     (error) => ({ ok: false, error })
@@ -378,7 +428,7 @@ test('a render naming an unknown module raises PasteError naming it', () => with
   const page = paste.page();
   page.jam({ js: ['ghost'] });
   assert.throws(
-    () => page.dumpJs(),
+    () => page.dump('js'),
     (err) => err instanceof PasteError && /ghost/.test(err.message)
   );
 }));
@@ -389,8 +439,8 @@ test('async dumps render the same markup as the sync dumps', async () => withTem
   const page = paste.page();
   page.jam({ css: ['site.theme'], js: ['app'] });
 
-  const cssTag = await page.dumpCssAsync();
-  const jsTags = await page.dumpJsAsync();
+  const cssTag = await page.dumpAsync('css');
+  const jsTags = await page.dumpAsync('js');
   assert.match(cssTag, /stylesheet/);
   assert.match(cssTag, /site\.theme\+v1\.0/);
   assert.match(jsTags, /^<script type="text\/javascript">PASTE_RT/);
@@ -400,8 +450,8 @@ test('async dumps render the same markup as the sync dumps', async () => withTem
 
   const syncPage = paste.page();
   syncPage.jam({ css: ['site.theme'], js: ['app'] });
-  assert.equal(cssTag, syncPage.dumpCss());
-  assert.equal(jsTags, syncPage.dumpJs());
+  assert.equal(cssTag, syncPage.dump('css'));
+  assert.equal(jsTags, syncPage.dump('js'));
 }));
 
 test('jam does not alias caller arrays', () => withTempDir((root) => {
@@ -418,7 +468,7 @@ test('jam does not alias caller arrays', () => withTempDir((root) => {
   js.length = 0;
   js.push('ghost');
 
-  const jsTags = page.dumpJs();
+  const jsTags = page.dump('js');
   assert.match(jsTags, /app\+v1\.0/);
   assert.doesNotMatch(jsTags, /ghost/);
 }));
