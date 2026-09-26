@@ -4850,6 +4850,12 @@ storage.backend = "dist"
         fs::write(&source, "var app = 1;").unwrap();
 
         fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&source).is_ok() {
+            // Permission bits do not stop a superuser or a sandbox that
+            // bypasses them, so this environment cannot express "unreadable".
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
         let result = AssetGraph::new(dist_config(dir.path(), false)).build();
         // Restore before asserting so cleanup cannot fail on some platforms.
         fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
@@ -4869,6 +4875,12 @@ storage.backend = "dist"
         fs::write(js_dir.join("app.js"), "var app = 1;").unwrap();
 
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&blocked).is_ok() {
+            // Same probe as above: skip when the runner can read through
+            // permission bits (root containers, some sandboxes).
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
         let result = AssetGraph::new(dist_config(dir.path(), false)).build();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err(), "a walk error must fail the build");
