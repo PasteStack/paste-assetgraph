@@ -1,3 +1,13 @@
+# paste-assetgraph v0.3.1
+
+**Date:** 2026-09-25
+
+## Fixed
+
+- The Python version test composes its expectation from the repository
+  `VERSION` file instead of a literal, so a version bump no longer fails the
+  source-tree composition check.
+
 # paste-assetgraph v0.3.0
 
 **Date:** 2026-09-25
