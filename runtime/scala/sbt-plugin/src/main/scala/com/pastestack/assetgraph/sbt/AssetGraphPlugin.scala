@@ -499,14 +499,14 @@ jam.hash-urls = $hashUrls
   /**
    * Convenience helpers for common paste setup.
    */
-  def withPaste(version: String = "2.0.1"): Seq[Setting[_]] = Seq(
+  def withPaste(version: String = "2.1.0"): Seq[Setting[_]] = Seq(
     libraryDependencies += "com.pastestack" % "paste-webjar" % version
   )
   
-  def withPasteElements(version: String = "0.1.0"): Seq[Setting[_]] = Seq(
+  def withPasteElements(version: String = "0.4.0"): Seq[Setting[_]] = Seq(
     libraryDependencies += "com.pastestack" % "paste-elements-webjar" % version
   )
   
-  def withPasteStack(pasteVersion: String = "2.0.1", elementsVersion: String = "0.1.0"): Seq[Setting[_]] =
+  def withPasteStack(pasteVersion: String = "2.1.0", elementsVersion: String = "0.4.0"): Seq[Setting[_]] =
     withPaste(pasteVersion) ++ withPasteElements(elementsVersion)
 }
