@@ -1,3 +1,31 @@
+# paste-assetgraph v0.4.0
+
+**Date:** 2026-10-22
+
+## Added
+
+- Versioned output contract: the build emits versioned, hash-addressed
+  files plus a manifest that records current outputs and retained history,
+  so pinned URLs stay resolvable across rebuilds and rollbacks.
+- `dist` is the default storage backend with retained history recorded
+  per asset; the `local` backend remains an explicit opt-in.
+- Licence collection and verification tooling: npm package and wheel
+  legal checks plus the extended third-party licence script audit
+  packaged artifacts against collected notice texts.
+
+## Changed
+
+- Combo URLs resolve their suffix from the URL alone — exactly one
+  trailing `.min.{ext}` or `.{ext}` is stripped without consulting the
+  manifest, since `.min` can never be part of a module name.
+
+## Fixed
+
+- Conditional (`304`) responses preserve the representation's content
+  type instead of reporting a generic one.
+- Serving, watching and packaging paths hardened across the pipeline;
+  the pekko combo route applies the same resolution rules.
+
 # paste-assetgraph v0.3.1
 
 **Date:** 2026-09-25
