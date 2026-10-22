@@ -2,6 +2,16 @@ import com.tomshley.magicroot.sbt.projectsettings.{PublishGitLabPlugin, Tomshley
 
 ThisBuild / versionScheme := Some("semver-spec")
 
+// The authoritative root legal texts ride inside every published JAR —
+// binary, sources, and docs alike — at the JVM-conventional paths,
+// sourced from the repo root so packaged copies can never drift from
+// the files license review sees.
+def legalMappings(repoRoot: File): Seq[(File, String)] = Seq(
+  (repoRoot / "LICENSE") -> "META-INF/LICENSE",
+  (repoRoot / "NOTICE.md") -> "META-INF/NOTICE",
+  (repoRoot / "THIRD_PARTY_LICENSES.md") -> "META-INF/THIRD_PARTY_LICENSES"
+)
+
 // Runtime tests use the bundled library unless PASTE_ASSETGRAPH_LIB explicitly selects one.
 ThisBuild / Test / fork := true
 
@@ -12,7 +22,13 @@ lazy val commonSettings = Seq(
   publishMavenStyle := true,
   magicRootPublishGitLabProjectId := sys.env.get("TOMSHLEY_CICD_PUBLISH_PROJECT_ID").map(_.toInt).getOrElse(70289607),
   licenses := Seq("Apache-2.0" -> url("https://www.apache.org/licenses/LICENSE-2.0")),
-  homepage := Some(url("https://github.com/PasteStack/paste-assetgraph"))
+  homepage := Some(url("https://github.com/PasteStack/paste-assetgraph")),
+  Compile / packageBin / mappings ++=
+    legalMappings((ThisBuild / baseDirectory).value / ".." / ".."),
+  Compile / packageSrc / mappings ++=
+    legalMappings((ThisBuild / baseDirectory).value / ".." / ".."),
+  Compile / packageDoc / mappings ++=
+    legalMappings((ThisBuild / baseDirectory).value / ".." / "..")
 )
 
 lazy val runtime = (project in file("runtime"))
@@ -41,8 +57,9 @@ lazy val pekko = (project in file("pekko"))
     scalaVersion := "3.3.1",
     libraryDependencies ++= Seq(
       "org.apache.pekko" %% "pekko-http" % "1.0.1",
-      "org.apache.pekko" %% "pekko-actor-typed" % "1.0.2",
-      "org.apache.pekko" %% "pekko-stream" % "1.0.2",
+      // Provided, as pekko-http declares it: the consumer chooses the Pekko
+      // version, so this library never pins a mixed module set on its classpath.
+      "org.apache.pekko" %% "pekko-stream" % "1.0.2" % Provided,
       "org.apache.pekko" %% "pekko-http-testkit" % "1.0.1" % Test,
       "org.apache.pekko" %% "pekko-stream-testkit" % "1.0.2" % Test,
       "org.scalatest" %% "scalatest" % "3.2.17" % Test

@@ -332,6 +332,34 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
     assert(config.contains("jam.hash-urls = true"), config)
   }
 
+  test("generated config spells unbounded retention as all and a bound as a number") {
+    def generate(keepVersions: Int): String =
+      AssetGraphPlugin.generateConfig(
+        Seq("src/main/web"),
+        "target/public",
+        "target/paste-assetgraph-manifest.json",
+        Seq.empty,
+        minify = true,
+        sourceMaps = true,
+        debugMode = false,
+        storageBackend = "dist",
+        keepVersions = keepVersions,
+        outputLayout = "flat",
+        buildDirName = "_paste_build"
+      )
+
+    // -1 is the plugin's keep-all sentinel — it lands as `all` because a
+    // negative number is not a valid retention count in the shared parser.
+    assert(generate(-1).contains("storage.keep-versions = all"))
+    assert(generate(0).contains("storage.keep-versions = 0"))
+    assert(generate(3).contains("storage.keep-versions = 3"))
+    // A value below the sentinel is a configuration error, never a
+    // silently-reset policy.
+    intercept[IllegalArgumentException] {
+      generate(-2)
+    }
+  }
+
   test("generated config carries the hash-urls opt-out when set") {
     val config = AssetGraphPlugin.generateConfig(
       Seq("src/main/web"),
@@ -348,6 +376,55 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
       hashUrls = false
     )
     assert(config.contains("jam.hash-urls = false"), config)
+  }
+
+  test("generated config carries the cdn origin only when set") {
+    def generate(cdnUrl: String): String =
+      AssetGraphPlugin.generateConfig(
+        Seq("src/main/web"),
+        "target/public",
+        "target/paste-assetgraph-manifest.json",
+        Seq.empty,
+        minify = true,
+        sourceMaps = true,
+        debugMode = false,
+        storageBackend = "local",
+        keepVersions = 10,
+        outputLayout = "flat",
+        buildDirName = "_paste_build",
+        cdnUrl = cdnUrl
+      )
+
+    val withCdn = generate("https://cdn.example")
+    assert(withCdn.contains("cdn.enabled = true"), withCdn)
+    assert(withCdn.contains("""cdn.url = "https://cdn.example""""), withCdn)
+    // Empty is disabled: no cdn keys land in the generated file at all.
+    val without = generate("")
+    assert(!without.contains("cdn.enabled"), without)
+    assert(!without.contains("cdn.url"), without)
+  }
+
+  test("generated config escapes quotes, backslashes and control characters in paths") {
+    // The shared parser decodes quoted values as JSON strings, so a value
+    // must survive the round trip byte-identically — a raw newline would
+    // split the line and corrupt the file rather than fail loudly.
+    val config = AssetGraphPlugin.generateConfig(
+      Seq("""src/odd"quoted"""", "src/back\\slash", "src/with\nnewline"),
+      "target/public",
+      "target/paste-assetgraph-manifest.json",
+      Seq("include\tpath"),
+      minify = true,
+      sourceMaps = false,
+      debugMode = false,
+      storageBackend = "local",
+      keepVersions = 10,
+      outputLayout = "flat",
+      buildDirName = "_paste_build"
+    )
+    assert(config.contains(
+      """source.dirs = ["src/odd\"quoted\"", "src/back\\slash", "src/with\nnewline"]"""
+    ), config)
+    assert(config.contains("""include-paths = ["include\tpath"]"""), config)
   }
 
   test("writeGeneratedConfig feeds hash-urls through the shared config path") {
@@ -457,6 +534,74 @@ final class AssetGraphPluginSpec extends AnyFunSuite {
         log.lines.exists(line => line.contains("absolute") && line.contains("manifest")),
         log.lines.mkString("\n")
       )
+    }
+  }
+
+  test("writeGeneratedConfig leaves an unchanged file's timestamp alone and rewrites only changed content") {
+    withDirectory { directory =>
+      val base = directory.toFile
+      val configFile = new java.io.File(base, "target/paste-assetgraph-generated.conf")
+      val resourceManaged = new java.io.File(base, "target/resource_managed")
+
+      def write(sourceDirs: Seq[String]): Unit =
+        AssetGraphPlugin.writeGeneratedConfig(
+          Logger.Null,
+          base,
+          configFile,
+          resourceManaged,
+          "",
+          sourceDirs,
+          "target/public",
+          Seq.empty,
+          minify = true,
+          sourceMaps = true,
+          debug = false,
+          storageBackend = "local",
+          keepVersions = 10,
+          "flat",
+          "_paste_build",
+          Seq.empty
+        )
+
+      write(Seq("src/main/web"))
+      val marker = FileTime.fromMillis(0L)
+      Files.setLastModifiedTime(configFile.toPath, marker)
+
+      // Same settings: the destination must not be touched at all.
+      write(Seq("src/main/web"))
+      assert(Files.getLastModifiedTime(configFile.toPath) == marker)
+
+      // Changed settings: the file is rewritten, so its stamp moves.
+      write(Seq("src/main/web", "lib/assets"))
+      assert(Files.getLastModifiedTime(configFile.toPath) != marker)
+      assert(
+        new String(Files.readAllBytes(configFile.toPath), UTF_8)
+          .contains("""source.dirs = ["src/main/web", "lib/assets"]""")
+      )
+    }
+  }
+
+  test("materializeManifest leaves a byte-identical managed file untouched and copies changed content") {
+    withDirectory { directory =>
+      val base = directory.toFile
+      val managed = new java.io.File(base, "target/resource_managed")
+      val source = new java.io.File(base, "conf/history.json")
+      IO.createDirectory(source.getParentFile)
+      IO.write(source, "{\"a\":1}")
+
+      val target = AssetGraphPlugin.materializeManifest(base, managed, "conf/history.json")
+      val marker = FileTime.fromMillis(0L)
+      Files.setLastModifiedTime(target.toPath, marker)
+
+      // Identical content: no copy, timestamp holds.
+      AssetGraphPlugin.materializeManifest(base, managed, "conf/history.json")
+      assert(Files.getLastModifiedTime(target.toPath) == marker)
+
+      // Changed content: the copy lands and the stamp moves.
+      IO.write(source, "{\"a\":2}")
+      AssetGraphPlugin.materializeManifest(base, managed, "conf/history.json")
+      assert(Files.getLastModifiedTime(target.toPath) != marker)
+      assert(new String(Files.readAllBytes(target.toPath), UTF_8) == "{\"a\":2}")
     }
   }
 

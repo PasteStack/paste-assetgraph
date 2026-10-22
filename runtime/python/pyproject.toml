@@ -9,6 +9,10 @@ dynamic = ["version"]
 description = "Thin loader for the paste-assetgraph native library"
 requires-python = ">=3.9"
 license = "Apache-2.0"
+# The publish job copies the repository's LICENSE, NOTICE.md and
+# THIRD_PARTY_LICENSES.md beside this file so all three ship in the sdist
+# and the wheel's license metadata.
+license-files = ["LICENSE", "NOTICE.md", "THIRD_PARTY_LICENSES.md"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

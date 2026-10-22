@@ -20,13 +20,39 @@ pluginCrossBuild / sbtVersion := "1.9.0"
 
 libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.19" % Test
 
+// The specs set JVM-wide properties (os.name, os.arch, the plugin version);
+// a forked test JVM keeps them out of the sbt server's own process.
+Test / fork := true
+
 // The plugin reads this at runtime to keep each version's extracted binary in
 // its own directory, so a new plugin release cannot reuse an older binary.
 Compile / resourceGenerators += Def.task {
   val output = (Compile / resourceManaged).value / "assetgraph-version.txt"
-  IO.write(output, version.value)
+  val content = version.value
+  // An unchanged version must not rewrite the resource — a fresh timestamp
+  // alone would propagate a spurious rebuild to everything that watches it.
+  if (!output.isFile || IO.read(output) != content) {
+    IO.write(output, content)
+  }
   Seq(output)
 }.taskValue
+
+// The authoritative root legal texts ride inside every published JAR —
+// binary, sources, and docs alike — at the JVM-conventional paths,
+// sourced from the repo root so packaged copies can never drift from
+// the files license review sees.
+def legalMappings(repoRoot: File): Seq[(File, String)] = Seq(
+  (repoRoot / "LICENSE") -> "META-INF/LICENSE",
+  (repoRoot / "NOTICE.md") -> "META-INF/NOTICE",
+  (repoRoot / "THIRD_PARTY_LICENSES.md") -> "META-INF/THIRD_PARTY_LICENSES"
+)
+
+Compile / packageBin / mappings ++=
+  legalMappings((ThisBuild / baseDirectory).value / ".." / ".." / "..")
+Compile / packageSrc / mappings ++=
+  legalMappings((ThisBuild / baseDirectory).value / ".." / ".." / "..")
+Compile / packageDoc / mappings ++=
+  legalMappings((ThisBuild / baseDirectory).value / ".." / ".." / "..")
 
 // CI supplies this project with the native binaries and native/manifest.json
 // produced by the Rust build job before the plugin is packaged.

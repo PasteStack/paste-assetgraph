@@ -11,25 +11,27 @@ import scala.collection.JavaConverters._
 
 /**
  * sbt plugin for paste-assetgraph.
- * 
+ *
  * For Scala projects, configure via sbt settings (no external config file needed).
  * The plugin generates a temp config and passes it to the Rust binary.
- * 
+ *
  * Usage in build.sbt:
  * {{{
  * enablePlugins(AssetGraphPlugin)
- * 
+ *
  * // Required settings (all prefixed with paste to avoid collisions)
  * pasteAssetGraphSourceDirs := Seq("src/main/assets/scss", "src/main/assets/js")
  * pasteAssetGraphOutputDir := "target/public"
  * pasteAssetGraphManifestPath := "target/paste-assetgraph-manifest.json"
- * 
+ *
  * // Optional settings
  * pasteAssetGraphIncludePaths := Seq("vendor/assets")
  * pasteAssetGraphMinify := true
- * pasteAssetGraphSourceMaps := true
  * pasteAssetGraphOutputLayout := "flat"
  * pasteAssetGraphBuildDirName := "_paste_build"
+ * pasteAssetGraphCdnUrl := "https://cdn.example"  // records cdn_base in the manifest
+ * pasteAssetGraphStorageBackend := "dist"         // the default; "local" keeps only the current version
+ * pasteAssetGraphKeepVersions := -1               // keep all; 0 current only; n bounds history
  * }}}
  *
  * Every directory in pasteAssetGraphSourceDirs is walked recursively and each
@@ -38,36 +40,37 @@ import scala.collection.JavaConverters._
  * <build-dir-name> directory beside their source instead of under the output
  * directory, and every manifest output is relative to the project base, which
  * is then also the runtime's output root.
- * 
+ *
  * For Python/Node/HTML projects, use external config file instead.
  */
 object AssetGraphPlugin extends AutoPlugin {
-  
+
   object autoImport {
     // Core settings - folder-based auto-discovery (old paste style)
     val pasteAssetGraphSourceDirs = settingKey[Seq[String]]("Source directories to scan for assets")
     val pasteAssetGraphOutputDir = settingKey[String]("Output directory for compiled assets")
     val pasteAssetGraphManifestPath = settingKey[String]("Path for generated manifest")
     val pasteAssetGraphIncludePaths = settingKey[Seq[String]]("Include paths for SCSS @import")
-    
+
     // Build settings
     val pasteAssetGraphMinify = settingKey[Boolean]("Minify output")
     val pasteAssetGraphOutputLayout = settingKey[String]("Compiled output layout: flat or beside-source")
     val pasteAssetGraphBuildDirName = settingKey[String]("Directory name beside-source output is written into")
-    val pasteAssetGraphStorageBackend = settingKey[String]("Storage backend for compiled output: local keeps only the current version, dist retains history")
-    val pasteAssetGraphKeepVersions = settingKey[Int]("Versions the dist backend retains per asset")
-    val pasteAssetGraphSourceMaps = settingKey[Boolean]("Generate source maps")
+    val pasteAssetGraphStorageBackend = settingKey[String]("Storage backend for compiled output: dist (the default) retains history, local keeps only the current version")
+    val pasteAssetGraphKeepVersions = settingKey[Int]("Versions the dist backend retains per asset; -1 (the default) keeps every version ever built, 0 keeps the current output only")
+    val pasteAssetGraphSourceMaps = settingKey[Boolean]("Generate source maps (not implemented — setting true makes the build warn)")
     val pasteAssetGraphDebug = settingKey[Boolean]("Build in debug mode")
     val pasteAssetGraphHashUrls = settingKey[Boolean]("Emit content-hash-qualified combo URLs (jam.hash-urls); false keeps the legacy +vN.0 token shape")
+    val pasteAssetGraphCdnUrl = settingKey[String]("Origin prefix written into the manifest for emitted asset URLs; empty leaves the manifest without one")
     val pasteAssetGraphBuild = taskKey[Unit]("Build assets")
     val pasteAssetGraphWatch = taskKey[Unit]("Watch assets for changes")
     val pasteAssetGraphWebJarPaths = taskKey[Seq[String]]("Auto-discovered webjar include paths")
   }
-  
+
   import autoImport._
-  
+
   override def trigger = noTrigger
-  
+
   override def projectSettings: Seq[Setting[_]] = Seq(
     // Defaults - folder-based auto-discovery
     pasteAssetGraphSourceDirs := Seq("src/main/assets/scss", "src/main/assets/js"),
@@ -77,18 +80,19 @@ object AssetGraphPlugin extends AutoPlugin {
     pasteAssetGraphMinify := true,
     pasteAssetGraphOutputLayout := "flat",
     pasteAssetGraphBuildDirName := "_paste_build",
-    pasteAssetGraphSourceMaps := true,
+    pasteAssetGraphSourceMaps := false,
     pasteAssetGraphDebug := false,
     pasteAssetGraphHashUrls := true,
-    pasteAssetGraphStorageBackend := "local",
-    pasteAssetGraphKeepVersions := 10,
-    
+    pasteAssetGraphCdnUrl := "",
+    pasteAssetGraphStorageBackend := "dist",
+    pasteAssetGraphKeepVersions := -1,
+
     pasteAssetGraphWebJarPaths := {
       val cp = (Compile / dependencyClasspath).value
       val extractDir = target.value / "paste-assetgraph-webjars"
       extractWebjars(cp, extractDir, streams.value.log)
     },
-    
+
     pasteAssetGraphBuild := {
       val log = streams.value.log
       val base = baseDirectory.value
@@ -103,7 +107,7 @@ object AssetGraphPlugin extends AutoPlugin {
       val allIncludes = pasteAssetGraphIncludePaths.value ++ webjarPaths
 
       // Generate config from settings
-      val configFile = base / "target" / "paste-assetgraph-generated.conf"
+      val configFile = target.value / "paste-assetgraph-generated.conf"
       writeGeneratedConfig(
         log,
         base,
@@ -121,25 +125,32 @@ object AssetGraphPlugin extends AutoPlugin {
         pasteAssetGraphOutputLayout.value,
         pasteAssetGraphBuildDirName.value,
         webjarPaths,
-        pasteAssetGraphHashUrls.value
+        pasteAssetGraphHashUrls.value,
+        pasteAssetGraphCdnUrl.value
       )
 
       log.info("Building assets with paste-assetgraph...")
-      
-      val targetDir = (base / "target").toPath
-      val exitCode = Binary.build(targetDir, configFile.absolutePath, debug, Some(base.absolutePath))
-      
+
+      val targetDir = target.value.toPath
+      val exitCode = Binary.build(
+        targetDir,
+        configFile.absolutePath,
+        debug,
+        Some(base.absolutePath),
+        Some(scala.sys.process.ProcessLogger(line => log.info(line), line => log.warn(line)))
+      )
+
       if (exitCode != 0) {
         throw new RuntimeException(s"paste-assetgraph failed with exit code $exitCode")
       }
-      
+
       log.info("Assets built successfully")
     },
-    
+
     pasteAssetGraphWatch := {
       val log = streams.value.log
       val base = baseDirectory.value
-      val configFile = base / "target" / "paste-assetgraph-generated.conf"
+      val configFile = target.value / "paste-assetgraph-generated.conf"
       val resourceManagedDir = (Compile / resourceManaged).value
       val webjarPaths = pasteAssetGraphWebJarPaths.value
       val allIncludes = pasteAssetGraphIncludePaths.value ++ webjarPaths
@@ -163,20 +174,27 @@ object AssetGraphPlugin extends AutoPlugin {
         pasteAssetGraphOutputLayout.value,
         pasteAssetGraphBuildDirName.value,
         webjarPaths,
-        pasteAssetGraphHashUrls.value
+        pasteAssetGraphHashUrls.value,
+        pasteAssetGraphCdnUrl.value
       )
 
       log.info("Watching assets for changes...")
-      val targetDir = (base / "target").toPath
-      val process = Binary.watch(targetDir, configFile.absolutePath, Some(base.absolutePath))
+      val targetDir = target.value.toPath
+      val process = Binary.watch(
+        targetDir,
+        configFile.absolutePath,
+        Some(base.absolutePath),
+        Some(scala.sys.process.ProcessLogger(line => log.info(line), line => log.warn(line)))
+      )
       try {
         val exitCode = process.exitValue()
         if (exitCode != 0) sys.error(s"paste-assetgraph watch failed with exit code $exitCode")
       } finally process.destroy()
     },
-    
+
     // Build assets and register the manifest as a managed resource.
-    // resourceGenerators runs before compile, ensuring:
+    // A resource generator runs whenever resources are needed — `run`,
+    // `test`, `package`, `fullClasspath` — not on a bare `compile`; then:
     // 1. Assets are built first (manifest generated)
     // 2. Manifest appears on the classpath (Paste.fromClasspath() works)
     // The managed copy is the one canonical resource wherever the build
@@ -203,7 +221,12 @@ object AssetGraphPlugin extends AutoPlugin {
           (Compile / resourceManaged).value,
           configured
         ).getCanonicalFile
-        existing || new SimpleFileFilter(_.getCanonicalFile == manifestSource)
+        // The local backend's bincode cache sits beside the manifest; it is
+        // build state, never a resource to ship.
+        val cacheSource = new File(manifestSource.getPath.stripSuffix(".json") + ".bin")
+        existing || new SimpleFileFilter(file =>
+          Set(manifestSource, cacheSource).contains(file.getCanonicalFile)
+        )
       }
     }
   )
@@ -217,26 +240,46 @@ object AssetGraphPlugin extends AutoPlugin {
 
   /** Guarantee the managed manifest resource exists: require the configured
     * source was generated, then copy it under the canonical managed name
-    * unless source and target are already the same file. */
+    * unless source and target are already the same file — or the copy would
+    * be byte-identical, in which case the target's timestamp must not move. */
   private[sbt] def materializeManifest(base: File, managed: File, configured: String): File = {
     val source = configuredManifest(base, managed, configured)
     require(source.isFile, s"Asset manifest was not generated: $source")
     val target = managed / "paste-assetgraph-manifest.json"
     if (source.getCanonicalFile != target.getCanonicalFile) {
       IO.createDirectory(managed)
-      IO.copyFile(source, target)
+      val unchanged = target.isFile &&
+        java.util.Arrays.equals(Files.readAllBytes(source.toPath), Files.readAllBytes(target.toPath))
+      if (!unchanged) {
+        IO.copyFile(source, target)
+      }
     }
     target
   }
-  
+
+  /** Escape for the generated config's quoted strings — the shared parser
+    * decodes them as JSON strings, so the full JSON escape set round-trips
+    * where a raw control character would corrupt the line. */
   private def escapeHoconValue(s: String): String =
-    s.replace("\\", "\\\\").replace("\"", "\\\"")
+    s.flatMap {
+      case '"'           => "\\\""
+      case '\\'          => "\\\\"
+      case '\b'          => "\\b"
+      case '\f'          => "\\f"
+      case '\n'          => "\\n"
+      case '\r'          => "\\r"
+      case '\t'          => "\\t"
+      case c if c < ' '  => f"\\u${c.toInt}%04x"
+      case c             => c.toString
+    }
 
   /** Resolve the manifest path, regenerate `configFile` from the current
-    * settings and write it — unconditionally, so a setting changed since the
-    * last build (layout, source dirs, backend) reaches watch as well. Both
-    * pasteAssetGraphBuild and pasteAssetGraphWatch go through here so the two
-    * paths cannot drift. */
+    * settings and write it — the regeneration is unconditional so a setting
+    * changed since the last build (layout, source dirs, backend) reaches
+    * watch as well, but the write itself only lands when the bytes differ:
+    * an unchanged file keeps its timestamp instead of forcing downstream
+    * consumers to see a spurious rebuild. Both pasteAssetGraphBuild and
+    * pasteAssetGraphWatch go through here so the two paths cannot drift. */
   private[sbt] def writeGeneratedConfig(
     log: Logger,
     base: File,
@@ -254,7 +297,8 @@ object AssetGraphPlugin extends AutoPlugin {
     outputLayout: String,
     buildDirName: String,
     webjarPaths: Seq[String],
-    hashUrls: Boolean = true
+    hashUrls: Boolean = true,
+    cdnUrl: String = ""
   ): Unit = {
     // Manifest goes to resourceManaged (sbt-web style)
     val manifestPath = if (configuredManifestPath.nonEmpty) {
@@ -286,10 +330,13 @@ object AssetGraphPlugin extends AutoPlugin {
       keepVersions,
       outputLayout,
       buildDirName,
-      hashUrls
+      hashUrls,
+      cdnUrl
     )
     IO.createDirectory(configFile.getParentFile)
-    IO.write(configFile, config)
+    if (!configFile.isFile || IO.read(configFile) != config) {
+      IO.write(configFile, config)
+    }
   }
 
   private[sbt] def generateConfig(
@@ -304,8 +351,16 @@ object AssetGraphPlugin extends AutoPlugin {
     keepVersions: Int,
     outputLayout: String,
     buildDirName: String,
-    hashUrls: Boolean = true
+    hashUrls: Boolean = true,
+    cdnUrl: String = ""
   ): String = {
+    // -1 is the keep-all sentinel, spelled `all` in the generated config —
+    // negative numbers are invalid there, so the boundary maps it rather
+    // than serializing a policy the parser would reject.
+    require(
+      keepVersions >= -1,
+      s"pasteAssetGraphKeepVersions must be -1 (keep all) or non-negative, got $keepVersions"
+    )
     // Flat key format for Rust parser. Every configured source dir goes in
     // verbatim and in order — each is walked recursively and classified by
     // extension, so a dir like src/main/web that holds JS and styles
@@ -329,15 +384,14 @@ manifest = "$escapedManifestPath"
 include-paths = [$escapedIncludes]
 debug-mode = $debugMode
 minify = $minify
-source-maps = $sourceMaps
-storage.backend = "${escapeHoconValue(storageBackend)}"
-storage.keep-versions = $keepVersions
-jam.enabled = true
-jam.base-path = "/paste"
+${if (sourceMaps) "source-maps = true\n" else ""}storage.backend = "${escapeHoconValue(storageBackend)}"
+storage.keep-versions = ${if (keepVersions == -1) "all" else keepVersions.toString}
 jam.hash-urls = $hashUrls
-"""
+${if (cdnUrl.nonEmpty) s"""cdn.enabled = true
+cdn.url = "${escapeHoconValue(cdnUrl)}"
+""" else ""}"""
   }
-  
+
   private[sbt] def validatedWebjarPaths(extractDir: File, relativePath: String): (File, File) = {
     val parts = relativePath.split("/", -1).toSeq
     val safeSegments = parts.size >= 3 && parts.forall { part =>
@@ -395,11 +449,15 @@ jam.hash-urls = $hashUrls
     // Group by artifact-version directory in first-seen order. When several
     // jars contribute to the same directory the first jar's entry wins for a
     // shared path, matching classpath precedence.
+    val byDirectory = entries.groupBy(_.directory)
     val groups = entries.map(_.directory).distinct.map { directory =>
-      val expected = entries.filter(_.directory == directory)
-        .foldLeft(Vector.empty[WebjarEntry]) { (unique, entry) =>
-          if (unique.exists(_.file == entry.file)) unique else unique :+ entry
+      val expected = byDirectory(directory)
+        .foldLeft((Vector.empty[WebjarEntry], Set.empty[File])) {
+          case ((unique, seen), entry) =>
+            if (seen(entry.file)) (unique, seen)
+            else (unique :+ entry, seen + entry.file)
         }
+        ._1
       directory -> expected
     }
 
@@ -495,18 +553,18 @@ jam.hash-urls = $hashUrls
     }
     IO.touch(new File(directory, ".extracted"))
   }
-  
+
   /**
    * Convenience helpers for common paste setup.
    */
   def withPaste(version: String = "2.1.0"): Seq[Setting[_]] = Seq(
     libraryDependencies += "com.pastestack" % "paste-webjar" % version
   )
-  
+
   def withPasteElements(version: String = "0.4.0"): Seq[Setting[_]] = Seq(
     libraryDependencies += "com.pastestack" % "paste-elements-webjar" % version
   )
-  
+
   def withPasteStack(pasteVersion: String = "2.1.0", elementsVersion: String = "0.4.0"): Seq[Setting[_]] =
     withPaste(pasteVersion) ++ withPasteElements(elementsVersion)
 }

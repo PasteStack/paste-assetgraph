@@ -197,6 +197,30 @@ final class BinarySpec extends AnyFunSuite with BeforeAndAfterEach {
     )
   }
 
+  test("a version property resolving outside the extraction root is refused before any file is written") {
+    val target = Files.createTempDirectory("paste-assetgraph-binary-spec")
+    val outside = target.resolve("outside")
+    System.setProperty("paste.assetgraph.version", "../../outside")
+
+    val error = intercept[IllegalArgumentException] {
+      Binary.extractBundled(target)
+    }
+
+    assert(error.getMessage.contains("Invalid assetgraph version directory"))
+    assert(
+      !Files.exists(outside),
+      "the escaping version must be refused before it creates a directory"
+    )
+  }
+
+  test("safeVersion keeps ordinary version spellings") {
+    assert(Binary.safeVersion("0.3.1") == "0.3.1")
+    assert(Binary.safeVersion("0.1.0-develop-a1b2c3d") == "0.1.0-develop-a1b2c3d")
+    Seq("..", "../../outside", "a/b", "a\\b", " leading", "trailing ", "", ".").foreach { value =>
+      assertThrows[IllegalArgumentException](Binary.safeVersion(value), s"version $value")
+    }
+  }
+
   test("no bundled binary for the platform leaves resolution to the caller") {
     val target = Files.createTempDirectory("paste-assetgraph-binary-spec")
     System.setProperty("os.name", "Linux")

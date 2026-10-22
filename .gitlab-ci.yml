@@ -4,20 +4,22 @@
 
 include:
   - project: 'tomshley/brands/global/tware/tech/products/provisioning/cicd-pipelines'
-    ref: 'v0.10.0'
+    ref: 'v0.13.0'
     file: '/adapters/gitlab/ci/adapter.yml'
 
 variables:
-  CICD_PIPELINES_RUNNER_TAG: "0.10.0"
+  CICD_PIPELINES_RUNNER_TAG: "0.13.0"
   BASE_CONTAINERS_REGISTRY: registry.gitlab.com/tomshley/brands/global/tware/tech/products/provisioning/base-containers
-  BASE_CONTAINERS_UPSTREAM_TAG: "0.6.0"
-  # One Rust toolchain for build, test, and publish: the one baked into
-  # CICD_PIPELINES_RUST_IMAGE. Cargo.toml's rust-version and the oxc pin track it.
+  BASE_CONTAINERS_UPSTREAM_TAG: "0.6.1"
+  # Build, test, and publish run on the toolchain baked into
+  # CICD_PIPELINES_RUST_IMAGE; the msrv-rust job proves Cargo.toml's
+  # rust-version floor (1.83) separately, and the oxc pin tracks that floor.
   TOMSHLEY_CICD_CARGO_BINARY: paste-assetgraph
   TOMSHLEY_CICD_CARGO_TARGETS: "x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-gnu"
   TOMSHLEY_CICD_CARGO_NATIVE_ROOT: runtime/scala/sbt-plugin/src/main/resources/native
   DETERMINISM_CONFIG: features/determinism.conf
   DETERMINISM_REFERENCE: .determinism/linux
+  PASTE_ASSETGRAPH_TEST_FIXTURE: "${CI_PROJECT_DIR}/target/shared-fixture"
 
 # Branch and tag pipelines carry the build; merge request pipelines would only
 # duplicate them (the adapter's workflow admits both), and a five-target
@@ -39,9 +41,50 @@ lint-rust:
   stage: .pre
   script:
     - cargo fmt --all --check
+    # The warning-denied lints the implementation contract makes mandatory —
+    # a clean compile alone is not the gate.
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
     # The release flow bumps VERSION, Cargo.toml and runtime/node/package.json
     # together; this line and the runtime/node version test catch a missed one.
     - test "$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)" = "$(tr -d '[:space:]' < VERSION)"
+    # The shipped binaries statically link every crate in Cargo.lock's
+    # normal dependency closure; their license texts must match it.
+    - python3 scripts/third_party_licenses.py --check
+
+# The declared minimum toolchain gets its own gate: the pinned image's
+# compiler is newer, so only a 1.83 job can prove rust-version = "1.83" is
+# honest — fmt and the warning-denied lints run under it exactly as the
+# release contract states, and the workspace tests run under it too. The
+# vendored entry image carries an immutable 1.83.0 toolchain with rustfmt
+# and clippy baked in; the upstream `rust:1.83` image is a minimal install
+# without them, so `cargo fmt` would fail before the gate even compiles.
+# The pinned 0.6.1 image vendors the C toolchain a musl Rust needs to
+# link build scripts, proc macros, and tests. It does not yet vendor
+# the Windows std component, so the job fetches it pinned by content —
+# same posture as the macOS SDK below. The last gate type-checks the
+# windows-gnu target at the same floor: the cfg(not(unix)) code paths
+# never compile on this host, so only a target check can see them.
+msrv-rust:
+  extends: [.runs-on-branch-or-tag]
+  image: ${BASE_CONTAINERS_REGISTRY}/entry-rust-1_83-vendored:${BASE_CONTAINERS_UPSTREAM_TAG}
+  stage: .pre
+  variables:
+    WIN_STD_SHA256: "854529418d3b7db1a60d7d49b07c648e6a660783275635f7f931247229877002"
+  script:
+    - apk add --no-cache curl xz
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+    - cargo test --locked --workspace
+    - |
+      component="rust-std-1.83.0-x86_64-pc-windows-gnu"
+      curl --fail --silent --show-error --location \
+        --output "/tmp/${component}.tar.xz" \
+        "https://static.rust-lang.org/dist/${component}.tar.xz"
+      echo "${WIN_STD_SHA256}  /tmp/${component}.tar.xz" | sha256sum -c -
+      mkdir -p /tmp/win-std && tar xJf "/tmp/${component}.tar.xz" -C /tmp/win-std
+      cp -r "/tmp/win-std/${component}/rust-std-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu" \
+        "$(rustc --print sysroot)/lib/rustlib/"
+    - cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
 
 build-rust:
   extends: [.runs-on-branch-or-tag, .tomshley-cicd-cargo-zigbuild]
@@ -53,7 +96,10 @@ build-rust:
     # and framework paths to the linker for apple-darwin targets only. Nothing
     # is added to RUSTFLAGS, so the Linux and Windows targets are unaffected.
     MACOS_SDK_VERSION: "14.5"
-    SDKROOT: "${CI_PROJECT_DIR}/.macos-sdk/MacOSX${MACOS_SDK_VERSION}.sdk"
+    # The extracted SDK is rebuilt from the verified archive on every
+    # run and is deliberately not cached — a cached directory could be
+    # substituted where the pinned archive cannot.
+    SDKROOT: "${CI_PROJECT_DIR}/.macos-sdk-current/MacOSX${MACOS_SDK_VERSION}.sdk"
     # Shared-library targets for the language runtimes — separate from the
     # musl CLI targets above.
     PASTE_LIB_TARGETS: "x86_64-unknown-linux-gnu.2.17 aarch64-unknown-linux-gnu.2.17 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-gnu"
@@ -63,43 +109,64 @@ build-rust:
     # replaced, a tag can be moved, and neither would be visible in a build log.
     MACOS_SDK_SHA256: "6e146275d19f027faa2e8354da5e0267513abf013b8f16ad65a231653a2b1c5d"
   cache:
-    key: macos-sdk-${MACOS_SDK_VERSION}
+    # The cache holds only the verified archive — keyed apart from the
+    # earlier layout that cached an extracted SDK, so that copy is never
+    # restored and re-uploaded again.
+    key: macos-sdk-archive-${MACOS_SDK_VERSION}
     paths:
       - .macos-sdk/
   before_script:
     - |
-      if [ -d "${SDKROOT}" ]; then
-        echo "Using cached macOS SDK ${MACOS_SDK_VERSION} at ${SDKROOT}"
+      mkdir -p .macos-sdk .macos-sdk-current
+      archive=".macos-sdk/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+      if [ -f "${archive}" ]; then
+        echo "Using cached macOS SDK archive ${MACOS_SDK_VERSION}"
       else
         echo "Downloading macOS SDK ${MACOS_SDK_VERSION}"
-        mkdir -p .macos-sdk
         curl --fail --silent --show-error --location \
-          --output "MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+          --output "${archive}" \
           "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
-        echo "${MACOS_SDK_SHA256}  MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" | sha256sum -c -
-        tar -xf "MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" -C .macos-sdk/
-        rm "MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
       fi
+      echo "${MACOS_SDK_SHA256}  ${archive}" | sha256sum -c -
+      rm -rf "${SDKROOT}"
+      tar -xf "${archive}" -C .macos-sdk-current/
       test -d "${SDKROOT}" || { echo "macOS SDK missing at ${SDKROOT}" >&2; exit 1; }
   script:
     - !reference [.tomshley-cicd-cargo-zigbuild, script]
     - |
-      # The release recipe uploads each binary as <binary>-<platform>[.exe], so
-      # the checksum file must name those files for `sha256sum -c SHA256SUMS` to
-      # verify a directory of downloaded assets. The build recipe writes the
-      # checksums under their native-resource paths, which no download carries;
-      # rewrite them from the layout it just produced. The plugin's own
-      # verification uses native/manifest.json and is untouched.
+      # The release recipe uploads each target/<triple>/release/<binary> as
+      # <binary>-<platform>[.exe], so SHA256SUMS must name exactly that
+      # upload set — a checksum entry without a published asset would make
+      # `sha256sum -c` fail on a directory of downloaded release files, and
+      # an uploaded file missing a checksum would go unverified. The build
+      # recipe's checksums carry native-resource paths no download uses, so
+      # they are regenerated here under the release names; the staging dir
+      # mirrors the upload names 1:1 and is checked against the targets the
+      # publisher reads, not trusted on its own say-so.
       rm -rf .release-assets
       mkdir -p .release-assets
-      for binary in "${TOMSHLEY_CICD_CARGO_NATIVE_ROOT}"/*/"${TOMSHLEY_CICD_CARGO_BINARY}"*; do
-        [ -f "${binary}" ] || { echo "no native binaries under ${TOMSHLEY_CICD_CARGO_NATIVE_ROOT}" >&2; exit 1; }
-        platform="$(basename "$(dirname "${binary}")")"
-        suffix="$(basename "${binary}")"
-        suffix="${suffix#"${TOMSHLEY_CICD_CARGO_BINARY}"}"
-        cp "${binary}" ".release-assets/${TOMSHLEY_CICD_CARGO_BINARY}-${platform}${suffix}"
+      . "${TOMSHLEY_CICD_TOOLBOX_ROOT}/lib/rust-targets.sh"
+      for target in ${TOMSHLEY_CICD_CARGO_TARGETS}; do
+        platform="$(rust_target_platform "${target}")" || \
+          { echo "no release platform mapping for ${target}" >&2; exit 1; }
+        binary="$(rust_target_binary "${target}" "${TOMSHLEY_CICD_CARGO_BINARY}")"
+        file="target/${target}/release/${binary}"
+        [ -f "${file}" ] || { echo "release binary not found: ${file}" >&2; exit 1; }
+        cp "${file}" ".release-assets/${TOMSHLEY_CICD_CARGO_BINARY}-${platform}${binary#"${TOMSHLEY_CICD_CARGO_BINARY}"}"
       done
-      (cd .release-assets && sha256sum -- *) > SHA256SUMS
+      # The legal files ride the release beside the binaries — uploaded
+      # under their basenames by the release recipe's extra-assets input
+      # (declared on the release-assets job below) and covered by the
+      # same SHA256SUMS a downloader verifies the binaries with.
+      cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md .release-assets/
+      (cd .release-assets && sha256sum -- "${TOMSHLEY_CICD_CARGO_BINARY}"-* LICENSE NOTICE.md THIRD_PARTY_LICENSES.md) > SHA256SUMS
+      # Candidate↔checksum parity: every uploaded file has exactly one entry
+      # and every entry names an uploaded file.
+      staged="$(cd .release-assets && ls | sort)"
+      summed="$(awk '{print $2}' SHA256SUMS | sort)"
+      [ "${staged}" = "${summed}" ] || { echo "SHA256SUMS does not cover the release candidate set 1:1" >&2; exit 1; }
+      (cd .release-assets && sha256sum -c "../SHA256SUMS" >/dev/null) || \
+        { echo "SHA256SUMS fails verification against the candidates" >&2; exit 1; }
       cat SHA256SUMS
     - |
       # The runtimes load the asset graph in-process from this shared library.
@@ -141,11 +208,13 @@ build-rust:
       (root / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
       PY
       cat "${PASTE_LIB_ROOT}/manifest.json"
+    - python3 tests/build_shared_fixture.py --build linux-musl-release --out "${PASTE_ASSETGRAPH_TEST_FIXTURE}"
   artifacts:
     paths:
       - target/*/release/paste-assetgraph*
       - runtime/scala/sbt-plugin/src/main/resources/native/
       - runtime/native/
+      - target/shared-fixture/
       - SHA256SUMS
     expire_in: 1 hour
 
@@ -164,9 +233,54 @@ build-sbt:
   needs: [build-rust]
   script:
     - cd runtime/scala
-    - sbt compile
+    - sbt package packageSrc packageDoc
     - cd sbt-plugin
-    - sbt compile package
+    - sbt compile package packageSrc packageDoc
+    # Every published JAR must carry the authoritative root legal texts at
+    # the JVM-conventional paths — inspect the real archives, not the build
+    # definition, so a dropped mapping fails here instead of in a release.
+    # Each family publishes binary, sources, and documentation archives —
+    # every classifier is required explicitly: a missing packageDoc would
+    # otherwise let a binary JAR satisfy a family that produced no
+    # documentation at all.
+    - |
+      cd "${CI_PROJECT_DIR}"
+      status=0
+      jars=""
+      # sbt appends the CI revision on branch pipelines (magicroot
+      # TomshleyCIBuildVersionPlugin); only tag pipelines use the bare VERSION.
+      version="$(head -1 VERSION | tr -d '[:space:]')${TOMSHLEY_CICD_BUILD_REVISION:+-${TOMSHLEY_CICD_BUILD_REVISION}}"
+      for spec in \
+        "runtime/scala/runtime/target/scala-*/paste-assetgraph-runtime_3-${version}.jar" \
+        "runtime/scala/runtime/target/scala-*/paste-assetgraph-runtime_3-${version}-sources.jar" \
+        "runtime/scala/runtime/target/scala-*/paste-assetgraph-runtime_3-${version}-javadoc.jar" \
+        "runtime/scala/pekko/target/scala-*/paste-assetgraph-pekko_3-${version}.jar" \
+        "runtime/scala/pekko/target/scala-*/paste-assetgraph-pekko_3-${version}-sources.jar" \
+        "runtime/scala/pekko/target/scala-*/paste-assetgraph-pekko_3-${version}-javadoc.jar" \
+        "runtime/scala/sbt-plugin/target/scala-*/sbt-*/paste-assetgraph-sbt*-${version}.jar" \
+        "runtime/scala/sbt-plugin/target/scala-*/sbt-*/paste-assetgraph-sbt*-${version}-sources.jar" \
+        "runtime/scala/sbt-plugin/target/scala-*/sbt-*/paste-assetgraph-sbt*-${version}-javadoc.jar" \
+      ; do
+        found=0
+        for jar in $spec; do
+          [ -f "$jar" ] || continue
+          jars="$jars
+          $jar"
+          found=1
+        done
+        [ "$found" -eq 1 ] || { echo "ERROR: expected artifact produced nothing: ${spec}"; status=1; }
+      done
+      for jar in $jars; do
+        for entry in LICENSE NOTICE.md THIRD_PARTY_LICENSES.md; do
+          meta="META-INF/${entry%.md}"
+          if ! unzip -p "$jar" "$meta" | diff -q - "$entry" > /dev/null; then
+            echo "ERROR: $jar does not carry $entry at $meta (or it diverges)"
+            status=1
+          fi
+        done
+      done
+      echo "legal-file gate examined:$(printf '%s\n' $jars | sed 's/^/ /')"
+      [ "$status" -eq 0 ] || exit 1
   artifacts:
     paths: [runtime/scala/**/target/]
     expire_in: 1 hour
@@ -196,6 +310,9 @@ test-node:
     PASTE_ASSETGRAPH_TEST_BIN: "${CI_PROJECT_DIR}/target/x86_64-unknown-linux-musl/release/paste-assetgraph"
   script:
     - cp -R runtime/native/native-lib runtime/node/native-lib
+    # The package must carry the legal files the publish job copies in.
+    - cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md runtime/node/
+    - node scripts/check_npm_package_legal.cjs
     - cd runtime/node
     - npm ci
     - npm test
@@ -207,6 +324,9 @@ test-python:
   needs: [build-rust]
   script:
     - cp -R runtime/native/native-lib runtime/python/src/paste_assetgraph/native-lib
+    - cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md runtime/python/
+    # The wheel must carry the legal files under its dist-info.
+    - python scripts/check_wheel_legal.py
     - python -m pip install --no-cache-dir ./runtime/python
     - python -m unittest discover -s runtime/python/tests -v
 
@@ -219,8 +339,9 @@ test-python-musl:
   image: python:3.13.2-alpine
 
 # A dist build must produce byte-identical output on every platform, because the
-# manifest and the rollups are committed artifacts consumers diff. The Linux run
-# publishes the reference bytes; the Windows run rebuilds and compares them.
+# manifest and the generated files are committed artifacts consumers diff. The
+# Linux run publishes the reference tree; the Windows run rebuilds and compares
+# every file.
 determinism-linux:
   extends: [.runs-on-branch-or-tag]
   image: ${CICD_PIPELINES_RUST_IMAGE}
@@ -231,11 +352,9 @@ determinism-linux:
     # time keeps the committed-bytes comparison platform-independent.
     - export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
     - target/x86_64-unknown-linux-musl/release/paste-assetgraph build --config "${DETERMINISM_CONFIG}"
-    - mkdir -p "${DETERMINISM_REFERENCE}"
-    - cp features/dist/manifest.json "${DETERMINISM_REFERENCE}/manifest.json"
-    - cp features/dist/js/assetgraph.js "${DETERMINISM_REFERENCE}/assetgraph.js"
-    - cp features/dist/css/assetgraph.css "${DETERMINISM_REFERENCE}/assetgraph.css"
-    - sha256sum "${DETERMINISM_REFERENCE}"/*
+    - mkdir -p "${DETERMINISM_REFERENCE}/dist"
+    - cp -r features/dist/. "${DETERMINISM_REFERENCE}/dist/"
+    - find "${DETERMINISM_REFERENCE}/dist" -type f -exec sha256sum {} +
   artifacts:
     paths: ["${DETERMINISM_REFERENCE}"]
     expire_in: 1 hour
@@ -250,19 +369,25 @@ determinism-windows:
     - $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
     - .\target\x86_64-pc-windows-gnu\release\paste-assetgraph.exe build --config $env:DETERMINISM_CONFIG
     - |
-      $rebuilt = @{
-        'manifest.json'  = 'features/dist/manifest.json'
-        'assetgraph.js'  = 'features/dist/js/assetgraph.js'
-        'assetgraph.css' = 'features/dist/css/assetgraph.css'
-      }
-      foreach ($name in $rebuilt.Keys) {
-        $linux = (Get-FileHash "$env:DETERMINISM_REFERENCE/$name" -Algorithm SHA256).Hash
-        $windows = (Get-FileHash $rebuilt[$name] -Algorithm SHA256).Hash
-        if ($linux -ne $windows) {
-          throw "$name differs between platforms: linux $linux, windows $windows"
+      # Hash every file under each dist tree keyed by its forward-slash
+      # relative path, then compare the two sets — a file that differs,
+      # appears, or disappears on one platform fails the check.
+      $hashTree = {
+        param($root)
+        $rootPath = (Get-Item $root).FullName
+        Get-ChildItem -Force -Recurse -File $rootPath | ForEach-Object {
+          $rel = $_.FullName.Substring($rootPath.Length + 1).Replace('\', '/')
+          "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $rel
         }
-        Write-Host "$name matches on both platforms ($windows)"
       }
+      $reference = @(& $hashTree "$env:DETERMINISM_REFERENCE\dist")
+      $rebuilt = @(& $hashTree "features\dist")
+      $diff = Compare-Object -CaseSensitive $reference $rebuilt
+      if ($diff) {
+        $diff | ForEach-Object { Write-Host $_.InputObject }
+        throw "features/dist differs between linux and windows ($($reference.Count) vs $($rebuilt.Count) files)"
+      }
+      Write-Host "$($rebuilt.Count) files match on both platforms"
 
 # Publishing waits for every test that judges the binaries being published —
 # the language-runtime tests exercise the binary's render/combo contract, and
@@ -282,7 +407,7 @@ publish-cli:
     - if: '$CI_COMMIT_BRANCH'
       when: manual
       allow_failure: true
-  needs: [build-rust, test-rust, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
+  needs: [lint-rust, msrv-rust, build-rust, test-rust, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
 
 # The recipe publishes one coordinate — the pinnable {ref-slug}-{sha}. A consumer
 # cannot track a branch by a version that changes every pipeline, so the rolling
@@ -290,7 +415,7 @@ publish-cli:
 # empty and the clean version publishes once, so the second pass is skipped.
 publish-maven:
   extends: [.tomshley-cicd-publish-sbt]
-  needs: [build-rust, test-rust, test-sbt, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
+  needs: [lint-rust, msrv-rust, build-rust, test-rust, test-sbt, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
   variables:
     TOMSHLEY_CICD_PUBLISH_PROJECT_ID: "70289607"
   before_script:
@@ -315,24 +440,27 @@ publish-maven:
 # this project's GitLab package registry.
 publish-npm:
   extends: [.tomshley-cicd-publish-npm]
-  needs: [build-rust, test-rust, test-node, test-node-musl, determinism-linux, determinism-windows]
+  needs: [lint-rust, msrv-rust, build-rust, test-rust, test-node, test-node-musl, determinism-linux, determinism-windows]
   script:
     - cp -R runtime/native/native-lib runtime/node/native-lib
+    - cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md runtime/node/
     - cd runtime/node
     - !reference [.tomshley-cicd-publish-npm, script]
 
 publish-python:
   extends: [.tomshley-cicd-publish-python]
-  needs: [build-rust, test-rust, test-python, test-python-musl, determinism-linux, determinism-windows]
+  needs: [lint-rust, msrv-rust, build-rust, test-rust, test-python, test-python-musl, determinism-linux, determinism-windows]
   variables:
     TOMSHLEY_CICD_PYPI_PACKAGE: paste-assetgraph
   script:
     - cp -R runtime/native/native-lib runtime/python/src/paste_assetgraph/native-lib
+    - cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md runtime/python/
     - cd runtime/python
     - !reference [.tomshley-cicd-publish-python, script]
 
 release-assets:
   extends: [.tomshley-cicd-release-assets]
-  needs: [build-rust, test-rust, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
+  needs: [lint-rust, msrv-rust, build-rust, test-rust, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
   variables:
     TOMSHLEY_CICD_RELEASE_CHECKSUM_FILE: SHA256SUMS
+    TOMSHLEY_CICD_RELEASE_EXTRA_ASSETS: "LICENSE NOTICE.md THIRD_PARTY_LICENSES.md"

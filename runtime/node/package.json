@@ -15,7 +15,10 @@
   "license": "Apache-2.0",
   "files": [
     "index.js",
-    "native-lib/"
+    "native-lib/",
+    "LICENSE",
+    "NOTICE.md",
+    "THIRD_PARTY_LICENSES.md"
   ],
   "dependencies": {
     "koffi": "2.16.3"

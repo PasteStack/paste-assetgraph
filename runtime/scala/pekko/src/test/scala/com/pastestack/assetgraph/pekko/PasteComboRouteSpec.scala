@@ -18,7 +18,7 @@ final class PasteComboRouteSpec extends AnyFlatSpec with Matchers with Scalatest
 
   // The first served request pays the one-time native library load — the
   // testkit's 1 s default is tighter than that cost on a cold JVM.
-  implicit val routeTimeout: RouteTestTimeout = RouteTestTimeout(10.seconds)
+  given RouteTestTimeout = RouteTestTimeout(10.seconds)
 
   private val ManifestJson = """{
     "version": "42",
@@ -26,7 +26,8 @@ final class PasteComboRouteSpec extends AnyFlatSpec with Matchers with Scalatest
     "modules": { "app": "js/app.js" },
     "assets": {
       "js/app.js": {
-        "source": "src/app.js", "output": "/js/app.h.v1.min.js", "hash": "h",
+        "source": "src/app.js", "output": "/js/app.h.v1.min.js",
+        "hash": "0bdbb2c325525e986d55ef50ca66d056",
         "version": 1, "timestamp": "2026-01-01T00:00:00Z",
         "dependencies": [], "history": []
       }
@@ -58,6 +59,78 @@ final class PasteComboRouteSpec extends AnyFlatSpec with Matchers with Scalatest
       }
     }
 
+  // The server layer drops a HEAD response's body; the route only has to
+  // match the method and answer as it would for GET.
+  it should "answer HEAD like GET" in
+    withTempDir("paste-route-head") { root =>
+      Head("/paste/1767225600/app+v1.0.min.js") ~> routeFor(root).route ~> check {
+        status shouldBe StatusCodes.OK
+        cacheControl shouldBe "public, max-age=31536000"
+      }
+    }
+
+  it should "leave non-GET requests on foreign paths to the caller's routes" in
+    withTempDir("paste-route-foreign") { root =>
+      val routes = concat(routeFor(root).route, path("users") { post { complete("created") } })
+      Post("/users") ~> routes ~> check {
+        responseAs[String] shouldBe "created"
+      }
+      Delete("/nothing-here") ~> org.apache.pekko.http.scaladsl.server.Route.seal(routes) ~> check {
+        status shouldBe StatusCodes.NotFound
+      }
+      Put("/users") ~> org.apache.pekko.http.scaladsl.server.Route.seal(routes) ~> check {
+        status shouldBe StatusCodes.MethodNotAllowed
+        header("Allow").map(_.value()) shouldBe Some("POST")
+      }
+    }
+
+  it should "forward If-Modified-Since and answer the library's 304" in
+    withTempDir("paste-route-conditional") { root =>
+      val lastModified = "Thu, 01 Jan 2026 00:00:00 GMT" // the fixture stamp
+      def lastModifiedHeader: Option[String] =
+        response.headers
+          .find(_.lowercaseName() == "last-modified")
+          .map(_.value())
+
+      // At the group stamp → the library's 304: no body, Last-Modified
+      // written from the response record.
+      Get("/paste/1767225600/app+v1.0.min.js")
+        .addHeader(org.apache.pekko.http.scaladsl.model.headers.`If-Modified-Since`(
+          org.apache.pekko.http.scaladsl.model.DateTime(1767225600000L))) ~>
+        routeFor(root).route ~> check {
+          status shouldBe StatusCodes.NotModified
+          responseAs[String] shouldBe ""
+          lastModifiedHeader shouldBe Some(lastModified)
+          cacheControl shouldBe "public, max-age=31536000"
+        }
+
+      // A stale validator → the ordinary 200, still stamped.
+      Get("/paste/1767225600/app+v1.0.min.js")
+        .addHeader(org.apache.pekko.http.scaladsl.model.headers.`If-Modified-Since`(
+          org.apache.pekko.http.scaladsl.model.DateTime(1735689600000L))) ~>
+        routeFor(root).route ~> check {
+          status shouldBe StatusCodes.OK
+          responseAs[String] shouldBe "APP"
+          lastModifiedHeader shouldBe Some(lastModified)
+        }
+    }
+
+  it should "let an unevaluated If-None-Match suppress the date condition" in
+    withTempDir("paste-route-precedence") { root =>
+      // RFC 9110 §13.2.2: If-None-Match outranks If-Modified-Since — the
+      // library evaluates no entity tags, so the date must not 304 on
+      // its own. A nonmatching tag plus a matching date answers 200.
+      Get("/paste/1767225600/app+v1.0.min.js")
+        .addHeader(org.apache.pekko.http.scaladsl.model.headers.`If-None-Match`(
+          org.apache.pekko.http.scaladsl.model.headers.EntityTag("nonexistent-tag")))
+        .addHeader(org.apache.pekko.http.scaladsl.model.headers.`If-Modified-Since`(
+          org.apache.pekko.http.scaladsl.model.DateTime(1767225600000L))) ~>
+        routeFor(root).route ~> check {
+          status shouldBe StatusCodes.OK
+          responseAs[String] shouldBe "APP"
+        }
+    }
+
   it should "write the library's location as the Location header on a 302" in
     withTempDir("paste-route-redirect") { root =>
       Get("/paste/1767225599/app+v1.0.min.js") ~> routeFor(root).route ~> check {
@@ -66,6 +139,38 @@ final class PasteComboRouteSpec extends AnyFlatSpec with Matchers with Scalatest
           .map(_.uri.toString) shouldBe Some("/paste/1767225600/app+v1.0.min.js")
         cacheControl shouldBe "no-cache"
         responseAs[String] shouldBe ""
+      }
+    }
+
+  it should "forward the raw request spelling so a non-canonical encoding redirects" in
+    withTempDir("paste-route-raw") { root =>
+      import org.apache.pekko.http.scaladsl.model.headers.{`Raw-Request-URI`, Location, RawHeader}
+      val encoded = "/paste/1767225600/app%2Bv1.0.min.js"
+      val canonical = "/paste/1767225600/app+v1.0.min.js"
+      val route = routeFor(root).route
+      // With the server's Raw-Request-URI header the library sees the
+      // client's own spelling and answers what Node and Python answer.
+      Get(encoded).addHeader(`Raw-Request-URI`(encoded)) ~> route ~> check {
+        status shouldBe StatusCodes.Found
+        header[Location].map(_.uri.toString) shouldBe Some(canonical)
+        cacheControl shouldBe "no-cache"
+      }
+      // A raw target naming another path is not this request's spelling.
+      Get(canonical).addHeader(`Raw-Request-URI`("/paste/1767225600/ghost+v1.0.min.js")) ~>
+        route ~> check {
+          status shouldBe StatusCodes.OK
+          responseAs[String] shouldBe "APP"
+        }
+      // A client-sent header of the same name is not the server's.
+      Get(canonical).addHeader(RawHeader("Raw-Request-URI", encoded)) ~> route ~> check {
+        status shouldBe StatusCodes.OK
+        responseAs[String] shouldBe "APP"
+      }
+      // Without the header the parsed path is all there is: Pekko renders
+      // it canonically.
+      Get(encoded) ~> route ~> check {
+        status shouldBe StatusCodes.OK
+        responseAs[String] shouldBe "APP"
       }
     }
 
@@ -83,7 +188,8 @@ final class PasteComboRouteSpec extends AnyFlatSpec with Matchers with Scalatest
           "modules": {},
           "assets": {
             "js/site/café.js": {
-              "source": "src/site/café.js", "output": "/js/site/café.h.v1.min.js", "hash": "h",
+              "source": "src/site/café.js", "output": "/js/site/café.h.v1.min.js",
+              "hash": "0d61f8370cad1d412f80b84d143e1257",
               "version": 1, "timestamp": "2026-01-01T00:00:00Z",
               "dependencies": [], "history": []
             }

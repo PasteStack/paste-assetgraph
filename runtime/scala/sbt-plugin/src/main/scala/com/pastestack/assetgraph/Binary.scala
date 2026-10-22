@@ -37,13 +37,31 @@ object Binary {
         )
       }
 
-  def build(targetDir: Path, configPath: String, debug: Boolean = false, cwd: Option[String] = None): Int =
-    run(Seq(path(targetDir).toString, "build", "--config", configPath) ++ debugFlag(debug) ++ cwdFlag(cwd))
+  /** Run a build. `logger` receives the CLI's stdout and stderr — pass the
+    * task's log so the output lands in sbt's own log (and `last`) rather
+    * than the JVM's console. */
+  def build(
+      targetDir: Path,
+      configPath: String,
+      debug: Boolean = false,
+      cwd: Option[String] = None,
+      logger: Option[ProcessLogger] = None
+  ): Int = {
+    val command = Process(
+      Seq(path(targetDir).toString, "build", "--config", configPath) ++ debugFlag(debug) ++ cwdFlag(cwd)
+    )
+    logger.fold(command.!)(command.!(_))
+  }
 
-  def watch(targetDir: Path, configPath: String, cwd: Option[String] = None): Process =
-    Process(Seq(path(targetDir).toString, "watch", "--config", configPath) ++ cwdFlag(cwd)).run()
-
-  private def run(arguments: Seq[String]): Int = Process(arguments).!
+  def watch(
+      targetDir: Path,
+      configPath: String,
+      cwd: Option[String] = None,
+      logger: Option[ProcessLogger] = None
+  ): Process = {
+    val command = Process(Seq(path(targetDir).toString, "watch", "--config", configPath) ++ cwdFlag(cwd))
+    logger.fold(command.run())(command.run(_))
+  }
 
   private def debugFlag(debug: Boolean): Seq[String] =
     if (debug) Seq("--debug") else Seq.empty
@@ -81,10 +99,14 @@ object Binary {
   private[assetgraph] def extractBundled(targetDir: Path): Option[Path] = {
     val platform = platformName
     val expected = resourceText("/native/manifest.json").flatMap(checksumFor(_, platform))
-    val binaryTarget = targetDir
-      .resolve(ExtractionDirectory)
-      .resolve(artifactVersion)
+    val extractionRoot = targetDir.resolve(ExtractionDirectory)
+    val binaryTarget = extractionRoot
+      .resolve(safeVersion(artifactVersion))
       .resolve(binaryFileName)
+    require(
+      binaryTarget.normalize().startsWith(extractionRoot.normalize()),
+      s"Invalid assetgraph extraction target: $binaryTarget"
+    )
 
     if (isExecutableFile(binaryTarget) && expected.contains(sha256(binaryTarget))) {
       Some(binaryTarget)
@@ -167,6 +189,20 @@ object Binary {
       .flatMap(_.split(java.io.File.pathSeparator).toSeq)
       .map(Paths.get(_).resolve(binaryFileName))
       .find(isExecutableFile)
+
+  /**
+   * `artifactVersion` becomes a directory name beneath the extraction
+   * root — it must be a single safe component: a value like
+   * `../../outside` would otherwise resolve the binary outside the
+   * caller's target directory.
+   */
+  private[assetgraph] def safeVersion(value: String): String = {
+    require(
+      value.matches("[A-Za-z0-9][A-Za-z0-9._+-]*"),
+      s"Invalid assetgraph version directory: $value"
+    )
+    value
+  }
 
   private def artifactVersion: String =
     Option(System.getProperty("paste.assetgraph.version"))

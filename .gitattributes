@@ -1,3 +1,5 @@
 # The determinism fixture is compared byte for byte across platforms, so its
 # checkout must not depend on the platform's line-ending conversion.
 features/determinism.* -text
+features/helper.js -text
+features/paste.js -text
