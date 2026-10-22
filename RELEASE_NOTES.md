@@ -1,3 +1,14 @@
+# paste-assetgraph v0.4.1
+
+**Date:** 2026-10-22
+
+## Fixed
+
+- Version metadata: `Cargo.toml`, `Cargo.lock` and `runtime/node`'s
+  package files now carry the release version, satisfying the
+  version-composition check that requires every manifest to agree with
+  `VERSION`.
+
 # paste-assetgraph v0.4.0
 
 **Date:** 2026-10-22
