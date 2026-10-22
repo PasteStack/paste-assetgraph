@@ -15,8 +15,11 @@ libraryDependencies += "com.pastestack" %% "paste-assetgraph-runtime" % "<native
 // Pekko HTTP route (optional)
 libraryDependencies += "com.pastestack" %% "paste-assetgraph-pekko" % "<native-runtime-version>"
 
-// sbt plugin (add to project/plugins.sbt)
-addSbtPlugin("com.pastestack" % "paste-assetgraph-sbt" % "0.1.0")
+// sbt plugin (add to project/plugins.sbt) — published from the same VERSION
+// file as the runtime jars, so the same <native-runtime-version> selects a
+// matching build (unversioned `%`: the plugin is sbt-1.x cross-built, not
+// Scala-versioned)
+addSbtPlugin("com.pastestack" % "paste-assetgraph-sbt" % "<native-runtime-version>")
 ```
 
 The runtime jar bundles the shared libraries; `PasteLibrary.resolve()` picks, in
@@ -42,7 +45,8 @@ val paste = Paste(Paste.Settings(
   manifest   = Paths.get("src/main/public/manifest.json"),
   outputBase = Paths.get("src/main/public"),
   // optional overrides:
-  // outputJs, outputCss, cdnBase = "", basePath = "/paste", inlineThreshold = 1024
+  // outputJs, outputCss, cdnBase = "", basePath = "/paste",
+  // inlineThreshold = 1024, perModule = false
 ))
 
 // …or load the manifest from the classpath (e.g. produced by the sbt plugin's
@@ -73,12 +77,37 @@ dispatcher, never the server's default one.
 `page.dump(AssetType.Css)`/`page.dump(AssetType.Js)` dump one type;
 `page.dump()` dumps both in one event — css markup first, then js.
 
-`page.jam(css = …, js = …, inline = false, sync = false, media = None)` records a
-jam and returns `""` so it can sit in the template as a statement. The dumps emit
-the real markup: an inlined runtime once, exact-group loader URLs, inline
-`<script>`/`<style>` groups under `inlineThreshold` (1024 bytes; `0` disables
-automatic inlining, `inline = true` forces it), `isLoading` marks for pending
-modules.
+`page.jam(css = …, js = …, inline = false, sync = false, media = None,
+condition = None, perModule = None)` records a jam and returns `""` so it
+can sit in the template as a statement. `condition` is an
+`Option[String]` — `Some("lt IE 9")` wraps the group's tags in
+`<!--[if …]>`…`<![endif]-->` and keeps a conditional js group out of the
+loaded set; `None` emits unconditionally. `perModule` is an `Option[Boolean]`:
+`Some(true)`/`Some(false)` overrides the render's per-module setting for
+that jam's groups in either direction; `None` inherits it —
+`Paste.Settings`/`Paste.fromClasspath` take `perModule = false` by
+default. With per-module on, an asynchronous JavaScript group requests
+its versioned files in dependency order through one loader block — each
+request starts after the previous file loads — instead of one combo URL;
+the host serves those file paths through its own static file mappings
+(see the [Pekko guide](../../docs/scala-pekko.md)). With `sync = true`
+the group's files run in order through synchronous `src` and inline tags,
+each file deciding to inline on its own; CSS emits one link or style tag
+per module with its own inlining decision, and separate asynchronous
+groups remain independent, as in combo mode. A `cdnBase = ""` inherits
+the manifest's recorded origin. The dumps emit the real markup: an
+inlined runtime once, exact-group loader URLs, inline `<script>`/`<style>`
+groups under `inlineThreshold` (1024 bytes; `0` disables automatic
+inlining, `inline = true` forces it — though a file that cannot safely
+inline still falls back to an external tag, and once an asynchronous
+group's first external request starts the rest of the group stays
+external even with `inline = true`, so no script can overtake its
+dependency or lose global scope), `isLoading` marks for pending modules.
+In per-module mode every emitted file must be readable and hash-verified
+at render time; the runtime follows the same contract — verified content
+that cannot safely inline falls back to synchronous tags naming the
+versioned runtime files rather than a combo URL, and a missing or
+tampered runtime file is a render error.
 
 `page.finish()` belongs on the root layout's last line — it returns `""` and
 seals the page after the library verifies every jammed module reached a dump
@@ -92,19 +121,32 @@ against the layout's own call.
 
 ## Combo route
 
-`new PasteComboRoute(paste).route` matches `GET` requests whose full path starts
+`new PasteComboRoute(paste).route` matches `GET` and `HEAD` requests whose full path starts
 with `paste.basePath + "/"` and forwards the path plus raw query to
 `paste.combo(pathAndQuery)` — a `ComboResponse` computed on the
-`default-blocking-io-dispatcher`. Because the match uses the full request path,
-the route composes under an enclosing `pathPrefix`: nest it with `basePath` set
+`default-blocking-io-dispatcher`. The forwarded path is the client's own
+spelling when the server sets `pekko.http.server.raw-request-uri-header = on`
+(the route reads the `Raw-Request-URI` header, and only when it names the
+path the server parsed); without it Pekko's parsed path re-renders in
+canonical encoding, so a percent-encoded spelling such as `app%2Bv1.0` serves
+200 where the Node and Python runtimes redirect it. Because the match uses
+the full request path, the route composes under an enclosing `pathPrefix`: nest it with `basePath` set
 to the complete prefix (e.g. `"/app/paste"` under `pathPrefix("app")`). The
 library's response passes straight through: its status, `Cache-Control` header,
-content type, body — and `location`, which the route writes as the `Location`
-header on a 302. A canonical versioned URL (pinned entries, canonical order,
+content type, body — `location`, which the route writes as the `Location`
+header on a 302, and `lastModified`, written as the `Last-Modified` header.
+The request's `If-Modified-Since` header forwards into the same conditional
+decision the other runtimes make — for an immutable response (the canonical
+versioned URL or a recorded loader segment) a validator at or after the
+group's manifest-derived stamp answers a 304 with an empty body; unversioned
+and `require` responses always answer 200 — and
+`paste.combo(pathAndQuery, ifModifiedSince)` exposes the same overload
+in-process. A canonical versioned URL (pinned entries, canonical order,
 the group's own stamp) serves each `+vN` pin exactly — the current version or
 a retained history version — and gets `public, max-age=31536000`, with or
 without `?filter=`. A non-canonical versioned URL — a stale stamp, a
-non-numeric segment, an unsorted list, an unpinned name — is a `no-cache` 302
+non-numeric segment, an unpinned name, or a list out of canonical order —
+is a `no-cache` 302
 to the canonical URL; a stamp newer than the manifest knows, a version it
 cannot serve, and unversioned, `require` and 404 responses get `no-cache`.
 The route serves compiled output only — no on-the-fly compilation.
@@ -131,7 +173,8 @@ removed; their behavior now lives in the Rust library and is reached through
 
 ## sbt Integration
 
-The sbt plugin automatically builds assets during compilation:
+The sbt plugin builds assets whenever the project's resources are needed —
+`run`, `test`, `package`, `fullClasspath` (not a bare `compile`):
 
 ```scala
 // build.sbt
@@ -143,11 +186,17 @@ enablePlugins(AssetGraphPlugin)
 pasteAssetGraphSourceDirs := Seq("src/main/assets/js", "src/main/assets/scss")
 pasteAssetGraphOutputDir := "target/public"
 pasteAssetGraphMinify := true
-pasteAssetGraphSourceMaps := true
 
 // Optional: the manifest location (defaults to the managed-resources dir),
-// and the storage backend. `local` keeps only the current version of each
-// asset; `dist` retains `pasteAssetGraphKeepVersions` versions per asset.
+// and the storage backend. `dist` — the default — retains history, which
+// `pasteAssetGraphKeepVersions` bounds (`local` keeps only the current
+// version of each asset). Retention lasts as long as the output directory:
+// `target/` starts over after `sbt clean`, so a rolling deploy publishes each
+// build's versioned files to persistent storage or its CDN origin.
+// `pasteAssetGraphKeepVersions`: `-1` (the default, spelled
+// `all` in the generated config) keeps every version ever built, `n` keeps
+// the current output plus the `n` most recent historical versions, and `0`
+// keeps the current output only.
 pasteAssetGraphManifestPath := "src/main/resources/paste-assetgraph-manifest.json"
 pasteAssetGraphStorageBackend := "dist"
 
@@ -156,6 +205,12 @@ pasteAssetGraphStorageBackend := "dist"
 // (`module+vN.0-h{hash}`); `false` emits the legacy `+vN.0` form. The build
 // records the choice in the manifest, so runtime adapters need no setting.
 pasteAssetGraphHashUrls := true
+
+// Optional: origin prefix. `pasteAssetGraphCdnUrl` records the origin in the
+// manifest's cdn_base — the render-time default prefix for emitted tags,
+// which a `Paste.Settings`/`fromClasspath` cdnBase overrides. Empty (the
+// default) leaves the manifest without one.
+pasteAssetGraphCdnUrl := "https://cdn.example"
 ```
 
 `pasteAssetGraphBuild` runs as a `Compile / resourceGenerators` task, so the

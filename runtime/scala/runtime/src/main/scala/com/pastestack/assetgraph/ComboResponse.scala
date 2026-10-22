@@ -11,9 +11,12 @@ final case class ComboResponse(
   cacheControl: String,
   cacheable: Boolean,
   location: Option[String],
+  lastModified: Option[String],
   body: String
 )
 
-object ComboResponse extends DefaultJsonProtocol {
-  given format: RootJsonFormat[ComboResponse] = jsonFormat6(ComboResponse.apply)
+object ComboResponse {
+  // Imported, not inherited — see Jam's companion.
+  import DefaultJsonProtocol.*
+  given format: RootJsonFormat[ComboResponse] = jsonFormat7(ComboResponse.apply)
 }

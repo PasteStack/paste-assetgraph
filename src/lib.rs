@@ -5,8 +5,8 @@
 
 pub mod api;
 pub mod config;
+mod dirfd;
 pub mod graph;
 pub mod jam;
 pub mod manifest;
 pub mod storage;
-pub mod templates;

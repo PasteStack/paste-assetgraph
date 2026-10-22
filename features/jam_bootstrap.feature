@@ -1,7 +1,7 @@
 Feature: JAM Bootstrap Rendering
   As the paste-assetgraph render command
   I need to turn a page's jam/dump event list into markup
-  So that every runtime and the build-time renderer emit identical tags
+  So that every runtime and the CLI emit identical tags
 
   Background:
     Given a manifest with a compiled "paste" runtime module

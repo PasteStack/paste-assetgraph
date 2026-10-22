@@ -2,7 +2,7 @@
 
 The Scala runtime is a thin loader: all tag, URL and combo logic lives in the
 `paste-assetgraph` Rust library. `Paste` loads it through JNA and calls
-`paste_render` and `paste_combo` in-process, and `PasteComboRoute` serves the
+`paste_render_page` and `paste_combo` in-process, and `PasteComboRoute` serves the
 combo responses from Pekko HTTP.
 
 ## Installation
@@ -62,6 +62,37 @@ resource generator — use `Paste.fromClasspath()` instead (it copies the
 resource to a temp file once, defaulting `outputBase` to
 `Paste.defaultOutputBasePath`).
 
+`PasteComboRoute` serves combo URLs only. When `perModule` is on, dumps
+request each versioned file in dependency order naming its output path —
+`/js/…` and `/css/…` under the default flat layout — and the host serves
+them through its ordinary static handling. Composing the combo route with
+`getFromDirectory` keeps both on one server, using the same imports plus
+`java.nio.file.Paths` (already imported above):
+
+```scala
+  val compiled = Paths.get("src/main/public")   // the outputBase above
+  val routes = concat(
+    new PasteComboRoute(paste).route,
+    pathPrefix("js") { getFromDirectory(compiled.resolve("js").toString) },
+    pathPrefix("css") { getFromDirectory(compiled.resolve("css").toString) },
+    path("") {
+      get {
+        onSuccess(Future(views.html.home(paste))(blockingIo)) { page =>
+          complete(page)
+        }
+      }
+    }
+  )
+```
+
+The prefixes must match the emitted output paths: the flat layout emits
+`/js/…` and `/css/…` relative to `outputBase`. Custom `outputJs`/`outputCss`
+settings change the filesystem roots behind `/js` and `/css`; they do not
+rewrite manifest output paths. A CDN prefix or beside-source layout
+requires matching URL routing at the static origin; the emitted URL is the
+manifest's `output` pointer with one leading slash, percent-encoded per
+segment. There is no built-in static handler.
+
 ## Project Structure
 
 ```
@@ -69,7 +100,7 @@ my-app/
 ├── build.sbt
 ├── src/main/
 │   ├── resources/
-│   │   └── paste-surface.conf
+│   │   └── paste-assetgraph.conf
 │   ├── assets/                 # Source files
 │   │   ├── js/
 │   │   └── scss/
@@ -86,7 +117,7 @@ my-app/
 
 ## Configuration
 
-`src/main/resources/paste-surface.conf`:
+`src/main/resources/paste-assetgraph.conf`:
 ```hocon
 debug-mode = false
 
@@ -102,13 +133,14 @@ output.images = "src/main/public/images"
 manifest = "src/main/public/manifest.json"
 
 minify = true
-source-maps = true
 
-jam.enabled = true
-jam.base-path = "/paste"
-jam.inline-threshold = 1024
 jam.hash-urls = true    # qualify versioned URL tokens with content hashes (default)
 ```
+
+The combo base path and inline threshold live on `Paste.Settings`
+(`basePath`, `inlineThreshold`) — `jam.base-path`/`jam.inline-threshold`
+in the config still parse for compatibility but the build ignores them
+and reports a note.
 
 ## Twirl Templates
 
@@ -120,6 +152,7 @@ so render templates on a blocking dispatcher, never the default one.
 `views/home.scala.html`:
 ```scala
 @(paste: com.pastestack.assetgraph.Paste)
+@import com.pastestack.assetgraph.AssetType
 
 @defining(paste.page()) { page =>
 <!DOCTYPE html>
@@ -172,9 +205,10 @@ enablePlugins(AssetGraphPlugin)
 //   pasteAssetGraphOutputDir    := "target/public"
 //   pasteAssetGraphManifestPath := ""  // defaults to Compile/resourceManaged/paste-assetgraph-manifest.json
 //   pasteAssetGraphMinify       := true
-//   pasteAssetGraphSourceMaps   := true
 //   pasteAssetGraphDebug        := false
 //   pasteAssetGraphHashUrls     := true  // -h{hash} pins in versioned URLs
+//   pasteAssetGraphCdnUrl       := ""    // origin prefix written into the
+//                                        // manifest; empty leaves it unset
 //   pasteAssetGraphOutputLayout := "flat"           // or "beside-source"
 //   pasteAssetGraphBuildDirName := "_paste_build"   // beside-source output dir name
 
@@ -185,14 +219,17 @@ enablePlugins(AssetGraphPlugin)
 ```
 
 The plugin's `pasteAssetGraphBuild` runs as a `Compile / resourceGenerators`
-task, so assets build before compile and the manifest lands on the classpath
-(`Paste.fromClasspath()` finds it).
+task: assets build whenever resources are needed — `run`, `test`, `package`,
+`fullClasspath`, not a bare `compile` — and the manifest lands on the
+classpath (`Paste.fromClasspath()` finds it). A pipeline that packages
+`target/public` itself should run `pasteAssetGraphBuild` (or `package`)
+rather than only `compile`.
 
 ### Option 2: Manual
 
 ```bash
 # Build assets before running
-paste-assetgraph build --config src/main/resources/paste-surface.conf
+paste-assetgraph build --config src/main/resources/paste-assetgraph.conf
 
 # Run server
 sbt run
@@ -202,7 +239,7 @@ sbt run
 
 Terminal 1:
 ```bash
-paste-assetgraph watch --config src/main/resources/paste-surface.conf
+paste-assetgraph watch --config src/main/resources/paste-assetgraph.conf
 ```
 
 Terminal 2:
@@ -220,9 +257,13 @@ final case class Settings(
   outputBase: Path,
   outputJs: Option[Path] = None,       // default: <outputBase>/js
   outputCss: Option[Path] = None,      // default: <outputBase>/css
-  cdnBase: String = "",                // URL prefix for emitted tags
+  cdnBase: String = "",                // URL prefix for emitted tags;
+                                       // empty inherits the manifest's cdn_base
   basePath: String = "/paste",         // combo URL prefix + route mount
-  inlineThreshold: Int = 1024          // automatic inline limit; 0 disables
+  inlineThreshold: Int = 1024,         // automatic inline limit; 0 disables
+  perModule: Boolean = false           // one versioned-file request per
+                                       // resolved module, in dependency
+                                       // order
 )
 
 Paste(settings: Settings): Paste
@@ -231,7 +272,8 @@ Paste.fromClasspath(
   outputBase: Path = Paths.get(Paste.defaultOutputBasePath),
   cdnBase: String = "",
   basePath: String = "/paste",
-  inlineThreshold: Int = 1024
+  inlineThreshold: Int = 1024,
+  perModule: Boolean = false
 ): Paste
 ```
 
@@ -254,10 +296,23 @@ message.
 ```scala
 page.jam(css: Seq[String] = Nil, js: Seq[String] = Nil,
          inline: Boolean = false, sync: Boolean = false,
-         media: Option[String] = None): String   // records the jam, returns ""
+         media: Option[String] = None,
+         condition: Option[String] = None,
+         perModule: Option[Boolean] = None): String
+                                             // records the jam, returns "";
+                                             // condition wraps its tags in a
+                                             // downlevel conditional comment;
+                                             // perModule overrides the
+                                             // render setting for this jam
 page.dump(assetType: AssetType): String  // AssetType.Css or AssetType.Js
 page.dump(): String                      // both in one dump — css first, then js
+page.finish(): String                    // "" once every jammed module was dumped
 ```
+
+A page pins the manifest generation its first dump saw. A build that lands
+between two dumps of the same page makes the next call throw a
+`PasteException` whose `isManifestGeneration` is true, and the page is retired
+for good: discard it and render the request again on a fresh `paste.page()`.
 
 ## PasteComboRoute
 
@@ -265,7 +320,7 @@ page.dump(): String                      // both in one dump — css first, then
 new PasteComboRoute(paste).route: Route
 ```
 
-Matches `GET` requests whose full request path starts with
+Matches `GET` and `HEAD` requests whose full request path starts with
 `paste.basePath + "/"` and completes `Future(paste.combo(path + optional "?"
 + rawQuery))(blockingIo)` — the library call runs on the
 `default-blocking-io-dispatcher`. Because the match looks at the full URI, the
@@ -273,14 +328,22 @@ route composes under an enclosing `pathPrefix`: nest it inside
 `pathPrefix("app")` with `basePath = "/app/paste"`. Paths outside the base
 path are rejected.
 
+Set `pekko.http.server.raw-request-uri-header = on` for the same answers the
+Node and Python runtimes give: the route then forwards the request target as
+the client spelled it (taken from the `Raw-Request-URI` header, and only when
+it names the path the server parsed). Without it Pekko's parsed path renders
+in canonical percent-encoding, so a non-canonical spelling such as
+`app%2Bv1.0` reaches the library as `app+v1.0` and serves 200 instead of a
+302 to the canonical URL.
+
 The response passes through untouched:
 
 | Request | Status | Cache-Control |
 |---|---|---|
-| `/paste/{ts}/{module+vN-h{hash}~...}.min.{js\|css}` — canonical: pinned entries carrying each version's content hash under the default `jam.hash-urls` policy, canonical order, `ts` = the group's stamp | 200 at each pinned version — current or a retained history version | `public, max-age=31536000` |
-| `/paste/{ts}/{module+vN~...}.min.{js\|css}` — non-canonical: a stale stamp, a non-numeric segment, an unsorted list, an unpinned name, or a legacy `+vN` token under a qualified manifest | 302 with `Location` = the canonical URL (query preserved) | `no-cache`, empty body |
+| `/paste/{ts}/{module+vN-h{hash}~...}.min.{js\|css}` — canonical: pinned entries carrying each version's content hash under the default `jam.hash-urls` policy, `ts` = the group's stamp; a fully pinned list is canonical in the order written (each order is a different byte sequence), while a list containing an unpinned name canonicalizes to dependency order | 200 at each pinned version — current or a retained history version | `public, max-age=31536000` |
+| `/paste/{ts}/{module+vN~...}.min.{js\|css}` — non-canonical: a stale stamp, a non-numeric segment, an unpinned name, or a legacy `+vN` token under a qualified manifest | 302 with `Location` = the canonical URL (query preserved) | `no-cache`, empty body |
 | Same form with `ts` newer than the group's stamp — a URL from a newer build | 404 | `no-cache`, body `/* modules not found */` |
-| `/paste/{packages-segment}/{module}.js` | 200 — the runtime loader's URL, current build's segment only | `public, max-age=31536000` |
+| `/paste/{packages-segment}/{module}.js` | 200 — the runtime loader's URL, under the current segment or one the manifest recorded for an earlier build; an unrecorded segment is a `no-cache` 404 | `public, max-age=31536000` |
 | `/paste/{modules}.{js\|css}` (unversioned) | 200 | `no-cache` |
 | `/paste/require/{modules}.{ext}` or `?require` | 200 | `no-cache` |
 | `?filter=a~b` on a canonical versioned form | 200 | `public, max-age=31536000` |

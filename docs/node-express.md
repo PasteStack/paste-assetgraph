@@ -2,7 +2,7 @@
 
 The `@pastestack/assetgraph` package is a thin loader for the Rust shared
 library: all tag, URL and combo logic lives in the library. `createPaste`
-calls `paste_render` and `paste_combo` in-process through `koffi` with your
+calls `paste_render_page` and `paste_combo` in-process through `koffi` with your
 manifest and output paths.
 
 The package is ESM and requires Node >= 18. Its only runtime dependency is
@@ -25,8 +25,12 @@ import { createPaste } from '@pastestack/assetgraph';
 const paste = createPaste({
   manifest: 'static/manifest.json',
   outputBase: 'static',
-  // optional: outputJs, outputCss, cdnBase = '',
-  //           basePath = '/paste', inlineThreshold = 1024
+  // optional: outputJs, outputCss, cdnBase = '' (empty inherits the
+  //           manifest's cdn_base), basePath = '/paste',
+  //           inlineThreshold = 1024,
+  //           perModule = false — one versioned-file request per
+  //           resolved module in dependency order; a jam's perModule
+  //           overrides it
 });
 ```
 
@@ -42,16 +46,37 @@ import express from 'express';
 
 const app = express();
 
+// Per-module dumps request each versioned file in dependency order,
+// naming its output path — /js/... and /css/... under the default flat
+// layout. The combo route does not serve them; map those paths to the
+// compiled output through the host's ordinary static file handling.
+app.use('/js', express.static('static/js'));
+app.use('/css', express.static('static/css'));
+
 app.use(paste.basePath, async (req, res, next) => {
   try {
-    const r = await paste.combo(req.originalUrl);
+    // Forwarding the request's If-Modified-Since lets the library answer
+    // 304 for an unchanged immutable response — pass it, never your own.
+    // If-None-Match outranks the date condition (RFC 9110 §13.2.2): the
+    // library evaluates no entity tags, so the date must not decide while
+    // a tag condition stands unevaluated.
+    const ifModifiedSince = req.headers['if-none-match'] === undefined
+      ? req.headers['if-modified-since']
+      : undefined;
+    const r = await paste.combo(req.originalUrl, { ifModifiedSince });
     if (r.location !== null) {
       res.set('Location', r.location);
     }
+    if (r.lastModified !== null) {
+      res.set('Last-Modified', r.lastModified);
+    }
+    // end(), not send(): send() adds an ETag and re-runs Express's own
+    // freshness check, which would turn the library's deliberate 200 for a
+    // mutable unversioned or require combo into a stale 304.
     res.status(r.status)
        .set('Content-Type', r.contentType)
        .set('Cache-Control', r.cacheControl)
-       .send(r.body);
+       .end(r.body);
   } catch (err) {
     next(err);   // PasteError carries the library's message
   }
@@ -64,14 +89,24 @@ each pin also carries the version's full content hash (`-h{hash}`), which
 a request must match exactly or get a `no-cache` 404; successful
 versioned responses get `Cache-Control: public, max-age=31536000`;
 unversioned and `require` responses succeed with 200 and `no-cache`; a
-non-canonical versioned URL (a stale stamp, an unsorted list, an unpinned
+non-canonical versioned URL (a stale stamp, an unpinned
 name, a non-numeric segment, a legacy `+vN` token under a qualified
 manifest) is a `302` whose `location` field is the
-canonical URL; and a version or module the manifest cannot serve, or a stamp
+canonical URL — a fully pinned list is served in the order written, so
+two orders of the same members are two different canonical addresses; and a version or module the manifest cannot serve, or a stamp
 newer than the manifest knows, is a `no-cache` 404 — the response is a frozen
 object whose fields pass through unchanged. The wrapper
 adds no cache of its own — every call reaches the library, which keeps a
 bounded manifest cache that reloads when the manifest file changes.
+
+The static mounts are the host's responsibility and must match the emitted
+output paths: the flat layout above emits `/js/…` and `/css/…` paths
+relative to `outputBase`, so `/js` maps to `static/js`. Custom
+`outputJs`/`outputCss` settings change the filesystem roots behind `/js`
+and `/css`; they do not rewrite manifest output paths. A CDN prefix or
+beside-source layout requires matching URL routing at the static origin;
+the emitted URL is the manifest's `output` pointer with one leading slash,
+percent-encoded per segment.
 
 ## Page rendering
 
@@ -99,7 +134,7 @@ app.get('/', async (req, res, next) => {
 });
 ```
 
-`page.jam({ css, js, inline, sync, media })` records a group and returns `''`;
+`page.jam({ css, js, inline, sync, media, condition, perModule })` records a group and returns `''`;
 the dumps emit the markup — the inlined runtime once, exact-group loader URLs
 with `isLoading` marks, threshold-based inline groups. Insert them unescaped
 in your template engine of choice (e.g. `<%- css %>` in EJS, `{{{css}}}` in
@@ -119,7 +154,7 @@ type (and per `media` for css), so jams and dumps of the two types compose.
 
 ```
 my-app/
-├── paste-surface.conf
+├── paste-assetgraph.conf
 ├── static/
 │   ├── manifest.json          # Generated by paste-assetgraph
 │   ├── js/                    # Compiled output
