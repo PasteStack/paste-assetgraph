@@ -34,15 +34,18 @@ const MANIFEST = JSON.stringify({
   modules: { paste: 'js/paste.js', app: 'js/app.js', 'site.theme': 'css/theme.css' },
   assets: {
     'js/paste.js': {
-      source: 'src/paste.js', output: '/js/paste.h.v1.min.js', hash: 'h',
+      source: 'src/paste.js', output: '/js/paste.h.v1.min.js',
+      hash: '7e9e92b0857c477a6e8aebb0ab2bd924',
       version: 1, timestamp: '2026-01-01T00:00:00Z', dependencies: [], history: [],
     },
     'js/app.js': {
-      source: 'src/app.js', output: '/js/app.h.v1.min.js', hash: 'h',
+      source: 'src/app.js', output: '/js/app.h.v1.min.js',
+      hash: '0bdbb2c325525e986d55ef50ca66d056',
       version: 1, timestamp: '2026-01-01T00:00:00Z', dependencies: [], history: [],
     },
     'css/theme.css': {
-      source: 'src/theme.scss', output: '/css/theme.h.v1.min.css', hash: 'h',
+      source: 'src/theme.scss', output: '/css/theme.h.v1.min.css',
+      hash: '2c56c360580420d293172f42d85dfbed',
       version: 1, timestamp: '2026-01-01T00:00:00Z', dependencies: [], history: [],
     },
   },
@@ -113,6 +116,530 @@ test('a dump with a bad type rejects before any native call', () => withTempDir(
   assert.equal(page.finish(), '');
 }));
 
+test('a conditional jam wraps tags and does not mark js loaded', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  page.jam({ js: ['app'], condition: 'lt IE 9' });
+  const first = page.dump('js');
+  assert.match(first, /<!--\[if lt IE 9\]>\n/);
+  assert.match(first, /\n<!\[endif\]-->/);
+  // A conditional group cannot carry the unconditional bootstrap.
+  assert.doesNotMatch(first, /paste\.config/);
+
+  // js stays unloaded — the unconditional jam serves it again, with
+  // the bootstrap this time.
+  page.jam({ js: ['app'] });
+  const second = page.dump('js');
+  assert.match(second, /paste\.config/);
+  assert.match(second, /app\+v1\.0/);
+  assert.doesNotMatch(second, /<!--\[if/);
+  assert.equal(page.finish(), '');
+}));
+
+test('a conditional css jam still marks loaded', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  page.jam({ css: ['site.theme'], condition: 'lt IE 9' });
+  const first = page.dump('css');
+  assert.match(first, /<!--\[if lt IE 9\]>/);
+  assert.match(first, /<link rel="stylesheet"/);
+
+  // The stylesheet counted as delivered — nothing pending on re-jam.
+  page.jam({ css: ['site.theme'] });
+  assert.equal(page.dump('css'), '');
+  assert.equal(page.finish(), '');
+}));
+
+test('a mistyped condition rejects before the event is recorded', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+  for (const bad of [42, true, {}, ['x']]) {
+    assert.throws(
+      () => page.jam({ js: ['app'], condition: bad }),
+      (err) => err instanceof PasteError && /condition must be a string/.test(err.message)
+    );
+  }
+  page.jam({ js: ['app'], condition: 'IE 8' });
+  assert.match(page.dump('js'), /<!--\[if IE 8\]>/);
+  assert.equal(page.finish(), '');
+}));
+
+test('a scalar module name rejects instead of spreading into characters', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  // 'app' is one name, not three modules 'a','p','p' — a scalar is not a
+  // collection, and a collection's members must be strings. Each is a
+  // PasteError thrown synchronously, before the event could be recorded.
+  const circular = {};
+  circular.self = circular;
+  for (const bad of [
+    { js: 'app' }, { css: 'app' }, { js: 'site.theme' },
+    { js: 42 }, { js: { length: 1 } }, { js: ['app', 7] },
+    { js: ['app', null] }, { css: [Symbol('m')] },
+    // A circular value must still fail as PasteError — describing it for
+    // the message cannot throw a TypeError of its own.
+    { js: circular },
+  ]) {
+    assert.throws(
+      () => page.jam(bad),
+      (err) => err instanceof PasteError && /jam (css|js)/.test(err.message),
+      'expected a jam-list rejection'
+    );
+  }
+  // The options argument itself: an array is not an options object and
+  // must reject rather than silently record an empty jam.
+  for (const badOptions of [['app'], 'app', 42]) {
+    assert.throws(
+      () => page.jam(badOptions),
+      (err) => err instanceof PasteError && /options object/.test(err.message),
+      `expected a jam-options rejection for ${JSON.stringify(badOptions)}`
+    );
+  }
+
+  // Nothing was recorded: a valid jam still dumps and the page finishes —
+  // a malformed event cannot strand an otherwise usable page.
+  page.jam({ js: ['app'] });
+  assert.match(page.dump('js'), /app\+v1\.0/);
+  assert.equal(page.finish(), '');
+}));
+
+test('jam option types are checked before the event is recorded', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  // 'false' the string is truthy — coercing it would flip the flag, so the
+  // type itself is required. media is a string or absent; perModule a
+  // boolean or absent (null means inherit, same as omitted).
+  for (const [bad, name] of [
+    [{ js: ['app'], inline: 'false' }, 'inline'],
+    [{ js: ['app'], inline: 1 }, 'inline'],
+    [{ js: ['app'], sync: 'yes' }, 'sync'],
+    [{ js: ['app'], media: 42 }, 'media'],
+    [{ js: ['app'], media: { type: 'print' } }, 'media'],
+    [{ js: ['app'], perModule: 'true' }, 'perModule'],
+  ]) {
+    assert.throws(
+      () => page.jam(bad),
+      (err) => err instanceof PasteError && err.message.includes(`jam ${name}`),
+      `expected a jam-${name} rejection`
+    );
+  }
+
+  // Valid spellings — including the null/omitted inherit forms — record
+  // and render normally after the rejections: the inline flag inlines the
+  // body, so the module lands as its bytes rather than a pinned URL.
+  page.jam({ js: ['app'], inline: true, sync: true, perModule: true });
+  page.jam({ css: ['site.theme'], media: 'print', perModule: null });
+  assert.match(page.dump('js'), /APP/);
+  assert.match(page.dump('css'), /site\.theme\+v1\.0/);
+  assert.equal(page.finish(), '');
+}));
+
+test('a misspelled jam option rejects before the event is recorded', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  // 'per_module' would silently inherit the default delivery and 'sycn'
+  // the default ordering — an unknown name is a PasteError naming it,
+  // never a recorded event.
+  for (const [bad, name] of [
+    [{ js: ['app'], per_module: true }, 'per_module'],
+    [{ js: ['app'], sycn: true }, 'sycn'],
+    [{ js: ['app'], medias: 'print' }, 'medias'],
+    [{ js: ['app'], jsOptions: {} }, 'jsOptions'],
+  ]) {
+    assert.throws(
+      () => page.jam(bad),
+      (err) => err instanceof PasteError && err.message.includes(`no option "${name}"`),
+      `expected a rejection naming ${name}`
+    );
+  }
+
+  // Nothing was recorded: the perModule spelling lands per-module
+  // delivery on the same page and the page still finishes.
+  page.jam({ js: ['app'], perModule: true });
+  const tags = page.dump('js');
+  assert.match(tags, /app\.h\.v1\.min\.js/);
+  assert.doesNotMatch(tags, /app\+v1\.0/);
+  assert.equal(page.finish(), '');
+}));
+
+test('createPaste rejects a non-object settings argument before native load', () => {
+  // No manifest/library is supplied at all — the argument-shape failure
+  // precedes even locating the native library.
+  for (const bad of [null, 'manifest.json', ['/x'], 42]) {
+    assert.throws(
+      () => createPaste(bad),
+      (err) => err instanceof PasteError && err.message.includes('settings object'),
+      `expected a settings-object rejection for ${JSON.stringify(bad)}`
+    );
+  }
+});
+
+test('createPaste rejects unknown top-level keys before native load', () => {
+  // Every misspelling is rejected by name while the library path is
+  // deliberately unresolvable — loadLibrary must never run for these.
+  const nowhere = path.join('definitely', 'absent', 'native.so');
+  for (const key of ['per_module', 'cdn_base', 'output_js', 'base_path']) {
+    assert.throws(
+      () => createPaste({
+        manifest: '/x/manifest.json', outputBase: '/x/public',
+        [key]: 'x', library: nowhere,
+      }),
+      (err) => err instanceof PasteError && err.message.includes(key),
+      `expected a rejection naming ${key}`
+    );
+  }
+});
+
+test('createPaste requires non-empty manifest and outputBase paths', () => {
+  const nowhere = path.join('definitely', 'absent', 'native.so');
+  for (const [settings, name] of [
+    [{ outputBase: '/x/public', library: nowhere }, 'manifest'],
+    [{ manifest: '', outputBase: '/x/public', library: nowhere }, 'manifest'],
+    [{ manifest: '/x/manifest.json', library: nowhere }, 'outputBase'],
+    [{ manifest: '/x/manifest.json', outputBase: '', library: nowhere }, 'outputBase'],
+  ]) {
+    assert.throws(
+      () => createPaste(settings),
+      (err) => err instanceof PasteError && err.message.includes(name),
+      `expected a ${name} rejection`
+    );
+  }
+});
+
+test('createPaste validates primitive settings before native load', () => {
+  // A mistyped flag or threshold used to sail through construction and
+  // surface mid-render inside the native deserializer. Every bad value
+  // is a PasteError naming its option, and `library: nowhere` proves the
+  // rejection precedes even locating the library.
+  const nowhere = path.join('definitely', 'absent', 'native.so');
+  const base = {
+    manifest: '/x/manifest.json', outputBase: '/x/public', library: nowhere,
+  };
+  for (const [key, bad] of [
+    ['perModule', 'false'],
+    ['perModule', 1],
+    ['perModule', null],
+    ['inlineThreshold', -1],
+    ['inlineThreshold', 1.5],
+    ['inlineThreshold', '1024'],
+    ['inlineThreshold', NaN],
+    ['inlineThreshold', Infinity],
+    ['inlineThreshold', true],
+    ['basePath', null],
+    ['basePath', 42],
+    ['cdnBase', null],
+    ['cdnBase', false],
+  ]) {
+    assert.throws(
+      () => createPaste({ ...base, [key]: bad }),
+      (err) => err instanceof PasteError && err.message.includes(key),
+      `expected a ${key} rejection for ${JSON.stringify(bad)}`
+    );
+  }
+});
+
+test('createPaste rejects empty or mistyped output-directory overrides', () => {
+  // Absent means "inherit <outputBase>/{js,css}"; explicitly present
+  // means a usable directory path. An env-var expansion producing '' —
+  // or a null, number, boolean or NUL-carrying value — must fail at the
+  // call, never silently select the default.
+  const nowhere = path.join('definitely', 'absent', 'native.so');
+  const base = {
+    manifest: '/x/manifest.json', outputBase: '/x/public', library: nowhere,
+  };
+  for (const key of ['outputJs', 'outputCss']) {
+    for (const bad of ['', '   ', null, 42, true, {}, '/x\0y']) {
+      assert.throws(
+        () => createPaste({ ...base, [key]: bad }),
+        (err) => err instanceof PasteError && err.message.includes(key),
+        `expected a ${key} rejection for ${JSON.stringify(bad)}`
+      );
+    }
+  }
+});
+
+test('createPaste rejects non-string, blank and NUL required paths', () => {
+  // String(42) or String({}) used to serialize as "42"/"[object Object]"
+  // — a different path than the host meant, failing only at first render.
+  // Every invalid value is a PasteError naming its key before the library
+  // is even located (`library: nowhere` proves the order).
+  const nowhere = path.join('definitely', 'absent', 'native.so');
+  for (const key of ['manifest', 'outputBase']) {
+    for (const bad of [undefined, null, '', '   ', 42, false, true, [], {}, 'bad\0path']) {
+      assert.throws(
+        () => createPaste({
+          manifest: '/x/manifest.json', outputBase: '/x/public',
+          [key]: bad, library: nowhere,
+        }),
+        (err) => err instanceof PasteError && err.message.includes(key),
+        `expected a ${key} rejection for ${JSON.stringify(bad)}`
+      );
+    }
+  }
+});
+
+test('required paths are forwarded byte-equivalently, spaces and all', () => withTempDir((root) => {
+  // A valid path is never trimmed or rewritten: deliberately awkward
+  // names — interior spaces and non-ASCII — and a real render proves the
+  // native layer received them unaltered.
+  const dir = path.join(root, 'fixture dir with spaces');
+  const { manifest, out } = e2eFixture(dir);
+  const manifestSpaced = path.join(dir, 'manifest spåce.json');
+  fs.renameSync(manifest, manifestSpaced);
+  const paste = createPaste({
+    manifest: manifestSpaced, outputBase: out, inlineThreshold: 0, library: library(),
+  });
+  const page = paste.page();
+  page.jam({ js: ['app'] });
+  assert.match(page.dump('js'), /app\+v1\.0/);
+  assert.equal(page.finish(), '');
+}));
+
+test('outputJs and outputCss select their configured directories', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  // Each override replaces the whole <outputBase>/{js,css} directory.
+  // The integrity-checked bytes live only in the custom dirs while a
+  // byte trap sits at the defaults — silently resolving a default would
+  // read the wrong bytes and fail the recorded hash.
+  const customJs = path.join(root, 'custom-js');
+  const customCss = path.join(root, 'custom-css');
+  write(path.join(customJs, 'paste.h.v1.min.js'), 'PASTE_RT');
+  write(path.join(customJs, 'app.h.v1.min.js'), 'APP');
+  write(path.join(customCss, 'theme.h.v1.min.css'), 'CSS');
+  write(path.join(out, 'js/paste.h.v1.min.js'), 'TRAP');
+  write(path.join(out, 'js/app.h.v1.min.js'), 'TRAP');
+  write(path.join(out, 'css/theme.h.v1.min.css'), 'TRAP');
+
+  const paste = createPaste({
+    manifest, outputBase: out, outputJs: customJs, outputCss: customCss,
+    library: library(),
+  });
+  const page = paste.page();
+  page.jam({ js: ['app'], css: ['site.theme'], inline: true });
+  assert.match(page.dump('js'), /APP/);
+  assert.match(page.dump('css'), /CSS/);
+  assert.equal(page.finish(), '');
+}));
+
+test('inherited settings are never forwarded to the native boundary', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  // Recognized option names carried on the prototype must not reach the
+  // settings envelope: validation iterates own keys only, so an
+  // inherited perModule or cdnBase would silently override a default
+  // the caller never supplied.
+  const options = Object.create({
+    perModule: true,
+    cdnBase: 'https://cdn.invalid/',
+    basePath: '/inherited',
+    inlineThreshold: 0,
+  });
+  Object.assign(options, {
+    manifest, outputBase: out, inlineThreshold: 0, library: library(),
+  });
+  const paste = createPaste(options);
+
+  assert.equal(paste.basePath, '/paste', 'an inherited basePath overrode the default');
+  const page = paste.page();
+  page.jam({ js: ['app'] });
+  const tags = page.dump('js');
+  // Defaults held: combo tokens, not the per-module file URLs an
+  // inherited perModule would have emitted, and no inherited CDN origin.
+  assert.match(tags, /app\+v1\.0/);
+  assert.doesNotMatch(tags, /app\.h\.v1\.min\.js/);
+  assert.doesNotMatch(tags, /cdn\.invalid/);
+  assert.equal(page.finish(), '');
+}));
+
+test('an inherited library path is never loaded', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  // No own `library`: resolution falls to PASTE_ASSETGRAPH_LIB or the
+  // bundled artifact — never to the prototype's planted path, which
+  // would fail or load a different binary entirely.
+  const options = Object.create({ library: '/inherited/absent.so' });
+  Object.assign(options, { manifest, outputBase: out, inlineThreshold: 0 });
+  const paste = createPaste(options);
+  const page = paste.page();
+  page.jam({ js: ['app'] });
+  assert.match(page.dump('js'), /app\+v1\.0/);
+  assert.equal(page.finish(), '');
+}));
+
+test('a null-prototype settings dictionary is accepted', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const options = Object.assign(Object.create(null), {
+    manifest, outputBase: out, inlineThreshold: 0, library: library(),
+  });
+  const paste = createPaste(options);
+  const page = paste.page();
+  page.jam({ js: ['app'] });
+  assert.match(page.dump('js'), /app\+v1\.0/);
+  assert.equal(page.finish(), '');
+}));
+
+test('a settings getter is read exactly once', () => {
+  // Validation reads keys; the snapshot reads each value a single time.
+  // A getter invoked twice — once to validate, once to destructure —
+  // would be caller-visible side effects the API must not have.
+  let reads = 0;
+  const options = { outputBase: '/x/public', library: library() };
+  Object.defineProperty(options, 'manifest', {
+    enumerable: true,
+    get: () => {
+      reads += 1;
+      return '/x/manifest.json';
+    },
+  });
+  createPaste(options);
+  assert.equal(reads, 1);
+});
+
+test('inherited jam options never reach the recorded event', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+  // An empty own-options jam whose prototype carries recognized keys:
+  // the inherited js list and flags must not record or apply.
+  const options = Object.create({ js: ['app'], perModule: true, inline: true });
+  assert.equal(page.jam(options), '');
+  const tags = page.dump('js');
+  // Neither the module token ('app+v1.0') nor the inlined bytes ('APP')
+  // may appear — the inherited list and flags never recorded.
+  assert.doesNotMatch(tags, /app/i);
+  // An inherited misspelling still rejects by name — the own-key rule
+  // applies to what the caller set, never what the prototype happens
+  // to carry.
+  const misspelled = Object.assign(Object.create({ sycn: true }), { js: ['app'] });
+  page.jam(misspelled); // own keys are all recognized — records normally
+  assert.match(page.dump('js'), /app\+v1\.0/);
+  assert.equal(page.finish(), '');
+}));
+
+test('jam records exactly the declared names, caller copies included', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  // Order and repetition are the caller's contract — preserved verbatim
+  // until the library resolves the dependency order.
+  const js = ['app', 'app'];
+  page.jam({ js, css: ['site.theme'] });
+  js.push('ghost'); // an aliased array would make the dump name an unknown module
+  page.dump();
+  assert.equal(page.finish(), '');
+}));
+
+test('a manifest rewrite mid-page retires the page permanently', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+  page.jam({ css: ['site.theme'], js: ['app'] });
+  page.dump('css');
+
+  // A build lands between the page's dumps — the manifest's bytes move
+  // and so does its generation token (the stamp needs the mtime bump:
+  // the rewrite is the same length).
+  fs.writeFileSync(manifest, MANIFEST.replace('"version":"42"', '"version":"43"'));
+  const future = new Date(Date.now() + 60000);
+  fs.utimesSync(manifest, future, future);
+
+  assert.throws(
+    () => page.dump('js'),
+    (err) => err instanceof PasteError
+      && err.kind === 'manifest-generation'
+      && /generation/.test(err.message)
+  );
+  // The failure is terminal: every later step answers the recorded
+  // error rather than rendering against a manifest the page's earlier
+  // dumps were not planned with.
+  for (const step of [
+    () => page.jam({ js: ['app'] }),
+    () => page.dump(),
+    () => page.finish(),
+  ]) {
+    assert.throws(step, (err) => err.kind === 'manifest-generation');
+  }
+}));
+
+test('a manifest rewrite retires the page across async steps too', async () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+  page.jam({ css: ['site.theme'], js: ['app'] });
+  await page.dumpAsync('css');
+
+  fs.writeFileSync(manifest, MANIFEST.replace('"version":"42"', '"version":"43"'));
+  const future = new Date(Date.now() + 60000);
+  fs.utimesSync(manifest, future, future);
+
+  await assert.rejects(
+    () => page.dumpAsync('js'),
+    (err) => err.kind === 'manifest-generation'
+  );
+  await assert.rejects(
+    () => page.finishAsync(),
+    (err) => err.kind === 'manifest-generation'
+  );
+  assert.throws(
+    () => page.jam({ js: ['app'] }),
+    (err) => err.kind === 'manifest-generation'
+  );
+}));
+
+test('a dump queued before a generation mismatch never reaches native', async () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+  page.jam({ css: ['site.theme'], js: ['app'] });
+  await page.dumpAsync('css');
+
+  // A build lands between the page's steps.
+  fs.writeFileSync(manifest, MANIFEST.replace('"version":"42"', '"version":"43"'));
+  const future = new Date(Date.now() + 60000);
+  fs.utimesSync(manifest, future, future);
+
+  // Dump A fails against the changed generation; dump B and the finish
+  // are queued behind it before the mismatch lands. A retired page must
+  // surface the SAME stored error — if B or the finish replayed a stale
+  // event list into the native layer, each would come back as a fresh
+  // error object instead.
+  const a = page.dumpAsync('js');
+  const b = page.dumpAsync();
+  const fin = page.finishAsync();
+
+  let errA;
+  await assert.rejects(a, (err) => {
+    errA = err;
+    return err.kind === 'manifest-generation';
+  });
+  await assert.rejects(b, (err) => {
+    assert.equal(
+      err,
+      errA,
+      'a job queued before retirement rethrows the stored error — no second native call'
+    );
+    return true;
+  });
+  await assert.rejects(fin, (err) => {
+    assert.equal(
+      err,
+      errA,
+      'finish waits out the queue, then answers the stored error without calling native'
+    );
+    return true;
+  });
+}));
+
 test('a no-argument async dump renders every type', async () => withTempDir(async (root) => {
   const { manifest, out } = e2eFixture(root);
   const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
@@ -124,6 +651,30 @@ test('a no-argument async dump renders every type', async () => withTempDir(asyn
   assert.match(html, /site\.theme\+v1\.0/);
   assert.match(html, /app\+v1\.0/);
   assert.equal(await page.finishAsync(), '');
+}));
+
+test('combo rejects unknown or non-object options', async () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, library: library() });
+  await assert.rejects(paste.combo('/paste/app.js', { ifModifedSince: 'x' }), PasteError);
+  await assert.rejects(paste.combo('/paste/app.js', 'Thu, 01 Jan 2026 00:00:00 GMT'), PasteError);
+  assert.equal((await paste.combo('/paste/app.js', {})).status, 200);
+}));
+
+test('a bare PASTE_ASSETGRAPH_LIB name resolves against the working directory', () => {
+  const resolved = resolveLibrary({ PASTE_ASSETGRAPH_LIB: path.relative(process.cwd(), library()) });
+  assert.ok(path.isAbsolute(resolved), resolved);
+});
+
+test('a burst beyond koffi\'s async cap queues instead of failing', async () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, library: library() });
+  const results = await Promise.allSettled(
+    Array.from({ length: 600 }, () => paste.combo('/paste/1767225600/app+v1.0.min.js')),
+  );
+  const rejected = results.filter((r) => r.status === 'rejected');
+  assert.equal(rejected.length, 0, rejected[0]?.reason?.message);
+  assert.ok(results.every((r) => r.value.status === 200 && r.value.body === 'APP'));
 }));
 
 test('combo passes through the library response, frozen', async () => withTempDir(async (root) => {
@@ -159,6 +710,44 @@ test('a stale stamp answers a redirect carrying location', async () => withTempD
   assert.equal(r.location, '/paste/1767225600/app+v1.0.min.js');
   assert.equal(r.cacheControl, 'no-cache');
   assert.equal(r.body, '');
+}));
+
+// The conditional form is the same library decision with the request's
+// validator forwarded — the fixture group stamps 2026-01-01T00:00:00Z.
+test('combo with a validator answers 304 or 200 by the recorded stamp', async () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, library: library() });
+  const url = '/paste/1767225600/app+v1.0.min.js';
+
+  // At or after the group stamp → 304, empty body, stamped header.
+  for (const ims of ['Thu, 01 Jan 2026 00:00:00 GMT', 'Thu, 01 Jan 2026 00:00:01 GMT']) {
+    const r = await paste.combo(url, { ifModifiedSince: ims });
+    assert.equal(r.status, 304, ims);
+    assert.equal(r.body, '');
+    assert.equal(r.lastModified, 'Thu, 01 Jan 2026 00:00:00 GMT');
+    assert.equal(r.cacheControl, 'public, max-age=31536000');
+    assert.ok(Object.isFrozen(r));
+  }
+
+  // Before it, absent, or unparsable → the ordinary 200.
+  for (const ims of ['Wed, 01 Jan 2025 00:00:00 GMT', 'not a date', undefined]) {
+    const r = await paste.combo(url, ims === undefined ? {} : { ifModifiedSince: ims });
+    assert.equal(r.status, 200, ims);
+    assert.equal(r.body, 'APP');
+    assert.equal(r.lastModified, 'Thu, 01 Jan 2026 00:00:00 GMT');
+  }
+
+  // A non-canonical URL still redirects first — the validator never
+  // suppresses canonicalization.
+  const r = await paste.combo('/paste/1767225599/app+v1.0.min.js', { ifModifiedSince: 'Thu, 01 Jan 2026 00:00:01 GMT' });
+  assert.equal(r.status, 302);
+  assert.equal(r.location, url);
+
+  // A NUL in the validator is rejected at the adapter, not by the library.
+  await assert.rejects(
+    paste.combo(url, { ifModifiedSince: 'Thu\0' }),
+    (err) => err instanceof PasteError && err.message === 'combo ifModifiedSince must not contain NUL',
+  );
 }));
 
 // The hash-qualified URL contract is decided in the library — the wrapper
@@ -227,6 +816,37 @@ test('hash-qualified URLs render, serve, redirect, and validate', async () => wi
   const tags = page2.dump('js');
   assert.match(tags, /app\+v1\.0\.min\.js/);
   assert.doesNotMatch(tags, /-h[0-9a-f]{32}/);
+}));
+
+test('perModule emits per-module tags and a jam overrides it', () => withTempDir((root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, inlineThreshold: 0, perModule: true, library: library() });
+
+  // Global on: the dump names each module's versioned file — one
+  // ordered loader block per async group, no combo token.
+  const page = paste.page();
+  page.jam({ js: ['app'] });
+  const perModuleTags = page.dump('js');
+  assert.match(perModuleTags, /\/js\/app\.h\.v1\.min\.js/);
+  assert.match(perModuleTags, /paste\.require/);
+  assert.doesNotMatch(perModuleTags, /app\+v1\.0/);
+  assert.equal(page.finish(), '');
+
+  // perModule: false on a jam renders the combo group the setting would
+  // suppress — the override goes both ways.
+  const combo = paste.page();
+  combo.jam({ js: ['app'], perModule: false });
+  const comboTags = combo.dump('js');
+  assert.match(comboTags, /app\+v1\.0/);
+  assert.doesNotMatch(comboTags, /\/js\/app\.h\.v1\.min\.js/);
+  assert.equal(combo.finish(), '');
+
+  // And perModule: true flips a combo-setting page.
+  const comboSetting = createPaste({ manifest, outputBase: out, inlineThreshold: 0, library: library() });
+  const flipped = comboSetting.page();
+  flipped.jam({ js: ['app'], perModule: true });
+  assert.match(flipped.dump('js'), /\/js\/app\.h\.v1\.min\.js/);
+  assert.equal(flipped.finish(), '');
 }));
 
 test('finish seals the page; a jam its type never dumped fails', () => withTempDir((root) => {
@@ -303,6 +923,44 @@ test('a failed finish leaves the page open for the missing dump', async () => wi
   page.dump('css');
   page.dump('js');
   assert.equal(page.finish(), '');
+}));
+
+test('finishAsync waits out every pending dump before it answers', async () => withTempDir(async (root) => {
+  const out = path.join(root, 'public');
+  write(path.join(out, 'js/paste.h.v1.min.js'), 'PASTE_RT');
+  write(path.join(out, 'js/app.h.v1.min.js'), 'APP');
+  write(path.join(out, 'css/theme.h.v1.min.css'), 'CSS');
+  // The manifest is absent until restored below — the first dump fails in
+  // the library.
+  const manifestPath = path.join(root, 'manifest.json');
+  const paste = createPaste({ manifest: manifestPath, outputBase: out, inlineThreshold: 0, library: library() });
+  const page = paste.page();
+
+  page.jam({ css: ['site.theme'], js: ['app'] });
+  const first = page.dumpAsync('js');
+  // Restoring the manifest on the first failure means the queued second
+  // dump succeeds — but its native call is still running when the first
+  // failure lands, so an answering finish would unseal a page that call
+  // still writes into.
+  const restored = first.catch((err) => {
+    write(manifestPath, MANIFEST);
+    return err;
+  });
+  const second = page.dumpAsync('css');
+  let secondSettled = false;
+  second.then(
+    () => { secondSettled = true; },
+    () => { secondSettled = true; }
+  );
+  const fin = page.finishAsync();
+
+  await assert.rejects(fin);
+  assert.ok(
+    secondSettled,
+    'finish must not answer while a queued dump still has native work in flight'
+  );
+  assert.match(await second, /stylesheet/);
+  assert.ok((await restored) instanceof PasteError);
 }));
 
 test('concurrent same-type async dumps render in record order', async () => withTempDir(async (root) => {
@@ -541,6 +1199,21 @@ test('a combo path containing NUL is rejected, not truncated', () => withTempDir
     paste.combo('/paste/app.js\0/paste/1770000000/app+v1.0.min.js'),
     (err) => err instanceof PasteError && err.message === 'combo path must not contain NUL'
   );
+}));
+
+test('combo rejects a non-string path before the native call', () => withTempDir(async (root) => {
+  const { manifest, out } = e2eFixture(root);
+  const paste = createPaste({ manifest, outputBase: out, library: library() });
+
+  // A null, number, array or object used to die as a TypeError inside
+  // .includes — the contract is a PasteError, and nothing is coerced.
+  for (const bad of [null, undefined, 42, ['/x'], { path: '/x' }, true]) {
+    await assert.rejects(
+      paste.combo(bad),
+      (err) => err instanceof PasteError && err.message.includes('combo'),
+      `expected a combo rejection for ${JSON.stringify(bad)}`
+    );
+  }
 }));
 
 test('repeated createPaste loads do not exhaust koffi type registrations', () => withTempDir((root) => {

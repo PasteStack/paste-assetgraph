@@ -31,25 +31,79 @@ object PasteLibrary {
   /** The library's C ABI as JNA sees it: UTF-8 JSON in, a heap C string of
     * envelope JSON out; every returned pointer goes to `paste_free`. */
   private[assetgraph] trait Native extends com.sun.jna.Library {
-    def paste_render(settings: String, events: String): Pointer
+    def paste_render_page(settings: String, events: String, generation: String): Pointer
     def paste_combo(settings: String, pathAndQuery: String): Pointer
+    def paste_combo_conditional(settings: String, pathAndQuery: String, ifModifiedSince: String): Pointer
     def paste_free(p: Pointer): Unit
   }
 
-  /** The loaded library — resolved and loaded once per JVM. */
-  private[assetgraph] lazy val native: Native =
-    com.sun.jna.Native.load(
-      resolve().toString,
-      classOf[Native],
-      java.util.Map.of(com.sun.jna.Library.OPTION_STRING_ENCODING, "UTF-8")
+  /** Every symbol [[Native]] binds; probed at load so a stale library
+    * fails here rather than on the first call that needs the symbol. */
+  private val Symbols =
+    Seq("paste_render_page", "paste_combo", "paste_combo_conditional", "paste_free")
+
+  /** The loaded library — resolved and loaded once per JVM. A library that
+    * cannot be loaded or lacks a symbol raises [[PasteException]]: JNA's
+    * UnsatisfiedLinkError is a fatal LinkageError, which a Future rethrows
+    * on its dispatcher thread instead of failing the request. */
+  private[assetgraph] lazy val native: Native = load(resolve().toString)
+
+  /** Load and probe the library at `path`; see [[native]]. */
+  private[assetgraph] def load(path: String): Native = {
+    val options = java.util.Map.of(com.sun.jna.Library.OPTION_STRING_ENCODING, "UTF-8")
+    try {
+      val library = com.sun.jna.NativeLibrary.getInstance(path, options)
+      Symbols.foreach(library.getFunction)
+      com.sun.jna.Native.load(path, classOf[Native], options)
+    } catch {
+      case e: LinkageError =>
+        throw new PasteException(
+          s"paste-assetgraph native library $path failed to load: ${e.getMessage}",
+          cause = e
+        )
+    }
+  }
+
+  /**
+   * Render one page step under `settingsJson`, pinned to `generation`
+   * when non-empty — an empty token asks for whatever the manifest
+   * currently is. Answers `(html, generation)`: the step's markup and
+   * the token the caller posts back on the next step. A token that no
+   * longer matches the manifest raises a [[PasteException]] whose `kind`
+   * is [[PasteException.ManifestGeneration]]; any other error envelope
+   * raises PasteException with its message.
+   */
+  private[assetgraph] def renderPage(
+    settingsJson: String,
+    eventsJson: String,
+    generation: String
+  ): (String, String) =
+    decodePage(
+      unwrap(take(native.paste_render_page(settingsJson, eventsJson, generation)))
     )
 
   /**
-   * Render `eventsJson` under `settingsJson`; an error envelope raises
-   * [[PasteException]] with its message.
+   * The page payload must carry both fields as strings — an absent or
+   * mistyped one is a malformed response, not a reason to default. An
+   * empty `generation` here would read as the caller's "accept the current
+   * manifest" sentinel, so only the library's own non-empty token returns.
    */
-  private[assetgraph] def render(settingsJson: String, eventsJson: String): String =
-    unwrap(take(native.paste_render(settingsJson, eventsJson))).convertTo[String]
+  private[assetgraph] def decodePage(payload: JsValue): (String, String) =
+    payload match {
+      case JsObject(fields) =>
+        (fields.get("html"), fields.get("generation")) match {
+          case (Some(JsString(html)), Some(JsString(token))) if token.nonEmpty =>
+            (html, token)
+          case _ =>
+            throw new PasteException(
+              "paste-assetgraph returned a malformed page response"
+            )
+        }
+      case _ =>
+        throw new PasteException(
+          "paste-assetgraph returned a malformed page response"
+        )
+    }
 
   /**
    * Resolve `pathAndQuery` under `settingsJson` to a [[ComboResponse]]; an
@@ -57,6 +111,17 @@ object PasteLibrary {
    */
   private[assetgraph] def combo(settingsJson: String, pathAndQuery: String): ComboResponse =
     unwrap(take(native.paste_combo(settingsJson, pathAndQuery)))
+      .convertTo[ComboResponse](ComboResponse.format)
+
+  /** The conditional form — `ifModifiedSince` is the request's raw
+    * header value; `null` reaches the entry point as a NULL pointer
+    * exactly like the no-validator call. */
+  private[assetgraph] def comboConditional(
+      settingsJson: String,
+      pathAndQuery: String,
+      ifModifiedSince: String
+  ): ComboResponse =
+    unwrap(take(native.paste_combo_conditional(settingsJson, pathAndQuery, ifModifiedSince)))
       .convertTo[ComboResponse](ComboResponse.format)
 
   /** Read the returned string and always release the native buffer. */
@@ -67,11 +132,16 @@ object PasteLibrary {
     finally native.paste_free(pointer)
   }
 
-  /** The envelope's `ok` payload, or [[PasteException]] carrying `error`. */
+  /** The envelope's `ok` payload, or [[PasteException]] carrying `error`
+    * — plus the machine `kind` when the library marks one. */
   private def unwrap(envelope: String): JsValue = {
     val fields = envelope.parseJson.asJsObject.fields
     fields.get("error") match {
-      case Some(error) => throw new PasteException(error.convertTo[String])
+      case Some(error) =>
+        throw new PasteException(
+          error.convertTo[String],
+          fields.get("kind").map(_.convertTo[String])
+        )
       case None =>
         fields.getOrElse(
           "ok",
@@ -99,7 +169,11 @@ object PasteLibrary {
     env: String => Option[String],
     bundled: => Option[Path]
   ): Path = {
-    val envOverride = env("PASTE_ASSETGRAPH_LIB").map(Paths.get(_))
+    // Absolute before both the check and the load: a bare name is
+    // searched on the library path by the loader, so the file checked
+    // against the working directory need not be the one that loads.
+    val envOverride =
+      env("PASTE_ASSETGRAPH_LIB").map(value => Paths.get(value).toAbsolutePath)
     envOverride.foreach { path =>
       if (!Files.isRegularFile(path))
         throw new IllegalStateException(

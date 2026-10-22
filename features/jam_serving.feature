@@ -87,9 +87,15 @@ Feature: JAM Combo Serving
     Then the status is 404 with body "/* modules not found */"
     And the Cache-Control header is "no-cache"
 
-  Scenario: A listed order that is not the dependency order redirects
+  Scenario: A fully pinned list serves in its listed order
     Given "paste.event" depends on "paste.dom"
     When I request "/paste/1770465409/paste.event+v1.0~paste.dom+v2.0.min.js"
+    Then the status is 200 with the members concatenated in the listed order
+    And the Cache-Control header is "public, max-age=31536000"
+
+  Scenario: An unpinned entry reorders to the dependency order
+    Given "paste.event" depends on "paste.dom"
+    When I request "/paste/1770465409/paste.event~paste.dom+v2.0.min.js"
     Then the status is 302
     And the Location names "paste.dom+v2.0~paste.event+v1.0" in that order
 
@@ -168,11 +174,17 @@ Feature: JAM Combo Serving
     Then the status is 200 with "paste.dom"'s current output
     And the Cache-Control header is "public, max-age=31536000"
 
-  Scenario: A stale loader segment redirects to the pinned URL
+  Scenario: An unrecorded loader segment is not found
     Given the manifest's packages segment is "71f8e72a3d6b"
+    And the manifest records no packages segment "deadbeef0000"
     When I request "/paste/deadbeef0000/paste.dom.js"
-    Then the status is 302 to "paste.dom"'s canonical pinned URL
+    Then the status is 404 with body "/* modules not found */"
     And the Cache-Control header is "no-cache"
+
+  Scenario: A recorded loader segment serves the pins it recorded
+    Given the manifest recorded packages segment "71f8e72a3d6b" for an earlier build
+    When I request "/paste/71f8e72a3d6b/paste.dom.js"
+    Then the status is 200 with the "paste.dom" version that segment recorded
 
   Scenario: Serving is compiled output only
     When I request any combo URL

@@ -4,7 +4,7 @@ Using paste-assetgraph with Python FastAPI and Jinja2 templates.
 
 The `paste-assetgraph` Python package is a thin loader for the Rust shared
 library: all tag, URL and combo logic lives in the library. `Paste` calls
-`paste_render` and `paste_combo` in-process through `ctypes` with your
+`paste_render_page` and `paste_combo` in-process through `ctypes` with your
 manifest and output paths. The package
 imports no web framework — it works the same from FastAPI, Flask, or Jinja.
 
@@ -25,7 +25,7 @@ falling through.
 
 ```
 my-fastapi-app/
-├── paste-surface.conf
+├── paste-assetgraph.conf
 ├── assets/
 │   ├── js/
 │   │   └── app.js
@@ -46,7 +46,7 @@ my-fastapi-app/
 
 ## Configuration
 
-**paste-surface.conf:**
+**paste-assetgraph.conf:**
 ```hocon
 source.dirs = ["assets/js", "assets/scss"]
 output.base = "static"
@@ -74,11 +74,21 @@ from paste_assetgraph import Paste
 
 app = FastAPI()
 
-# The wrapper holds the manifest/output paths and the loaded library
+# The wrapper holds the manifest/output paths and the loaded library.
+# Optional keywords: output_js, output_css, cdn_base ("" inherits the
+# manifest's cdn_base), base_path, inline_threshold, per_module (one
+# versioned-file request per resolved module in dependency order).
 paste = Paste("static/manifest.json", "static")
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Per-module dumps request each versioned file in dependency order,
+# naming its output path — /js/... and /css/... under the default flat
+# layout. The combo route does not serve them; map those paths to the
+# compiled output through ordinary static mounts.
+app.mount("/js", StaticFiles(directory="static/js"), name="compiled-js")
+app.mount("/css", StaticFiles(directory="static/css"), name="compiled-css")
 
 templates = Jinja2Templates(directory="templates")
 
@@ -91,10 +101,25 @@ def combo(path: str, request: Request):   # sync def: FastAPI runs it in its thr
     path_and_query = request.scope["raw_path"].decode("ascii")
     if request.url.query:
         path_and_query += f"?{request.url.query}"
-    r = paste.combo(path_and_query)   # in-process library call
+    # Forwarding If-Modified-Since lets the library answer 304 for an
+    # unchanged immutable response — forward it, never a value of your own.
+    # If-None-Match outranks the date condition (RFC 9110 §13.2.2): the
+    # library evaluates no entity tags, so the date must not decide while
+    # a tag condition stands unevaluated.
+    if_modified_since = (
+        None
+        if "if-none-match" in request.headers
+        else request.headers.get("if-modified-since")
+    )
+    r = paste.combo(
+        path_and_query,
+        if_modified_since=if_modified_since,
+    )   # in-process library call
     headers = {"Cache-Control": r.cache_control}
     if r.location is not None:
         headers["Location"] = r.location
+    if r.last_modified is not None:
+        headers["Last-Modified"] = r.last_modified
     return Response(
         content=r.body,
         status_code=r.status,
@@ -116,21 +141,40 @@ endpoint or `run_in_threadpool` so it does not block the event loop. The
 wrapper adds no cache of its own: every call reaches the library, which
 keeps a bounded manifest cache that reloads when the manifest file changes.
 
+The `/js` and `/css` mounts must match the emitted output paths: the flat
+layout emits `/js/…` and `/css/…` relative to `output_base`, so each mount
+names the matching `static/` subdirectory. Custom `output_js`/`output_css`
+settings change the filesystem roots behind `/js` and `/css`; they do not
+rewrite manifest output paths. A CDN prefix or beside-source layout
+requires matching URL routing at the static origin; the emitted URL is the
+manifest's `output` pointer with one leading slash, percent-encoded per
+segment.
+
 The response passes through the library's contract: each `+vN` in a versioned
 URL is served exactly — the current version or a retained history version —
 and under the default `jam.hash-urls` policy carries the version's full
 content hash (`-h{hash}`), which a request must match exactly or get a
 `no-cache` 404; successful versioned responses get
 `public, max-age=31536000`; a non-canonical versioned URL (a stale
-stamp, an unsorted list, an unpinned name, a non-numeric segment) is a 302
-whose `location` names the canonical URL; a version the manifest cannot
+stamp, an unpinned name, a non-numeric segment) is a 302
+whose `location` names the canonical URL — a fully pinned list is served
+in the order written, so two orders of the same members are two
+different canonical addresses; a version the manifest cannot
 serve, an unresolvable module, or a stamp newer than the manifest knows is a
 `no-cache` 404, never a partial group.
 
 ## Jinja Templates
 
-`page.jam(css=[...], js=[...])` records a group and returns `""`; the dumps
-emit the markup — mark them `| safe`.
+`page.jam(css=[...], js=[...], inline=False, sync=False, media=None,
+condition=None, per_module=None)` records a group and returns `""` —
+`condition` wraps its tags in a downlevel conditional comment, `per_module`
+overrides the render's per-module setting for that jam's groups in either
+direction — and the dumps emit the markup — mark them `| safe`.
+
+A page pins the manifest generation its first dump saw: a build landing
+between two dumps raises `PasteError` with `kind == "manifest-generation"`
+and retires the page for good. Discard it and render the request again on a
+fresh `paste.page()`.
 
 **templates/base.html:**
 ```html

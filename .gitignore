@@ -40,8 +40,25 @@ runtime/python/src/paste_assetgraph/native-lib/
 # Generated into an sdist by setup.py; never committed to the source tree.
 runtime/python/BUILD_VERSION
 
+# The publish jobs stage the repository's license texts beside each package
+# manifest; the committed copies live only at the repository root.
+runtime/node/LICENSE
+runtime/node/NOTICE.md
+runtime/node/THIRD_PARTY_LICENSES.md
+runtime/python/LICENSE
+runtime/python/NOTICE.md
+runtime/python/THIRD_PARTY_LICENSES.md
+
+# The macOS SDK cache and fresh extraction used by the Darwin build job
+.macos-sdk/
+.macos-sdk-current/
+.release-assets/
+
 # Output of the determinism fixture build
 features/dist/
+
+# The build's write lock — tooling state at the project root, never an asset
+manifest.lock
 
 # OS
 .DS_Store

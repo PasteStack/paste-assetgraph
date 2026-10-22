@@ -1,8 +1,18 @@
-//! The C ABI the language runtimes call. Two entry points —
-//! `paste_render` and `paste_combo` — take UTF-8 JSON strings and return a
-//! heap C string holding a JSON envelope: `{"ok": ...}` on success or
-//! `{"error": "<message>"}` on any failure. Every returned pointer must be
-//! released with `paste_free`.
+//! The C ABI the language runtimes call. Four entry points take UTF-8
+//! JSON strings and return a heap C string holding a JSON envelope —
+//! `{"ok": ...}` on success or `{"error": "<message>"}` on any failure,
+//! with an optional `"kind"` marking errors an adapter must distinguish:
+//!
+//! - `paste_render` — the classic per-jam markup for an event list
+//! - `paste_render_page` — one page's complete markup state
+//! - `paste_combo` — a combo response for a URL
+//! - `paste_combo_conditional` — `paste_combo` plus the request's
+//!   `If-Modified-Since`; the library decides 200 vs 304
+//!
+//! Every pointer these four return is heap memory owned by this library:
+//! it must be released exactly once with `paste_free` — a null pointer is
+//! a no-op — and never freed through the caller's own allocator.
+//! Returned strings stay valid until that call; copy out before freeing.
 
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -10,11 +20,35 @@ use std::ptr;
 
 use paste_assetgraph::api::{self, Settings};
 
-/// One FFI call's outcome: `{"ok": <json>}` or `{"error": "<message>"}`.
-fn envelope(result: Result<serde_json::Value, String>) -> *mut c_char {
+/// The error half of an envelope: the message, plus the machine `kind`
+/// an adapter matches on when one failure must be told apart from the
+/// rest.
+struct CallFailure {
+    message: String,
+    kind: Option<&'static str>,
+}
+
+impl From<String> for CallFailure {
+    fn from(message: String) -> Self {
+        CallFailure {
+            message,
+            kind: None,
+        }
+    }
+}
+
+/// One FFI call's outcome: `{"ok": <json>}` or `{"error": "<message>"}`
+/// — plus `"kind"` when the failure carries one.
+fn envelope(result: Result<serde_json::Value, CallFailure>) -> *mut c_char {
     let body = match result {
         Ok(value) => serde_json::json!({ "ok": value }),
-        Err(message) => serde_json::json!({ "error": message }),
+        Err(failure) => {
+            let mut body = serde_json::json!({ "error": failure.message });
+            if let Some(kind) = failure.kind {
+                body["kind"] = serde_json::json!(kind);
+            }
+            body
+        }
     };
     let text = serde_json::to_string(&body)
         .unwrap_or_else(|_| "{\"error\":\"envelope serialization failed\"}".to_string());
@@ -52,16 +86,16 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// Run `f` never letting a panic cross the FFI boundary: a Rust panic
 /// unwinding into a C caller is undefined behaviour, so every call is
 /// caught and reported in the envelope instead.
-fn guarded<F>(f: F) -> Result<serde_json::Value, String>
+fn guarded<F>(f: F) -> Result<serde_json::Value, CallFailure>
 where
-    F: FnOnce() -> Result<serde_json::Value, String>,
+    F: FnOnce() -> Result<serde_json::Value, CallFailure>,
 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
-        Err(payload) => Err(format!(
+        Err(payload) => Err(CallFailure::from(format!(
             "paste-assetgraph panicked: {}",
             panic_message(payload)
-        )),
+        ))),
     }
 }
 
@@ -91,6 +125,51 @@ pub unsafe extern "C" fn paste_render(
     }))
 }
 
+/// Render one page step against `settings_json`, pinned to the
+/// `generation` token an earlier `paste_render_page` call issued — an
+/// empty string asks for whatever generation the manifest currently is.
+/// The envelope's `ok` is `{"html": "...", "generation": "<token>"}`;
+/// a generation mismatch answers
+/// `{"error": "...", "kind": "manifest-generation"}` so an adapter can
+/// retire the page rather than serve markup mixed across two builds.
+///
+/// # Safety
+/// `settings_json`, `events_json` and `generation` must be null or point
+/// to valid NUL-terminated UTF-8 strings that outlive the call. The
+/// returned pointer is heap-allocated and must be freed exactly once with
+/// `paste_free`.
+#[no_mangle]
+pub unsafe extern "C" fn paste_render_page(
+    settings_json: *const c_char,
+    events_json: *const c_char,
+    generation: *const c_char,
+) -> *mut c_char {
+    envelope(guarded(|| {
+        let settings = parse_settings(read_str(settings_json, "settings")?)?;
+        let events = read_str(events_json, "events")?;
+        // NULL means "no token yet", exactly like the empty string — the
+        // same convention `paste_combo_conditional` applies to its validator.
+        let expected = if generation.is_null() {
+            None
+        } else {
+            let generation = read_str(generation, "generation")?;
+            (!generation.is_empty()).then_some(generation)
+        };
+        match api::render_page(&settings, events, expected) {
+            Ok(page) => Ok(serde_json::json!({
+                "html": page.html,
+                "generation": page.generation,
+            })),
+            Err(e) => Err(CallFailure {
+                message: format!("{e:#}"),
+                kind: e
+                    .downcast_ref::<api::GenerationMismatch>()
+                    .map(|_| "manifest-generation"),
+            }),
+        }
+    }))
+}
+
 /// Resolve the combo URL `path_and_query` against `settings_json`; the
 /// envelope's `ok` is the `ComboResponse` object.
 ///
@@ -107,15 +186,48 @@ pub unsafe extern "C" fn paste_combo(
         let settings = parse_settings(read_str(settings_json, "settings")?)?;
         let path_and_query = read_str(path_and_query, "pathAndQuery")?;
         let response = api::combo(&settings, path_and_query).map_err(|e| format!("{e:#}"))?;
-        serde_json::to_value(&response).map_err(|e| format!("{e:#}"))
+        Ok(serde_json::to_value(&response).map_err(|e| format!("{e:#}"))?)
     }))
 }
 
-/// Release a string returned by `paste_render` or `paste_combo`.
+/// `paste_combo` with the request's `If-Modified-Since` value — a NULL or
+/// empty `if_modified_since` behaves exactly like `paste_combo`. The
+/// response is the same `ComboResponse` shape plus its `lastModified`
+/// field; a 304 carries an empty body.
 ///
 /// # Safety
-/// `ptr` must be null (a no-op) or a pointer previously returned by
-/// `paste_render`/`paste_combo`, freed at most once.
+/// `settings_json`, `path_and_query`, and `if_modified_since` must be null
+/// or point to valid NUL-terminated UTF-8 strings that outlive the call.
+/// The returned pointer is heap-allocated and must be freed exactly once
+/// with `paste_free`.
+#[no_mangle]
+pub unsafe extern "C" fn paste_combo_conditional(
+    settings_json: *const c_char,
+    path_and_query: *const c_char,
+    if_modified_since: *const c_char,
+) -> *mut c_char {
+    envelope(guarded(|| {
+        let settings = parse_settings(read_str(settings_json, "settings")?)?;
+        let path_and_query = read_str(path_and_query, "pathAndQuery")?;
+        let validator = if if_modified_since.is_null() {
+            None
+        } else {
+            read_str(if_modified_since, "ifModifiedSince").map(|h| (!h.is_empty()).then_some(h))?
+        };
+        let response = api::combo_conditional(&settings, path_and_query, validator)
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(serde_json::to_value(&response).map_err(|e| format!("{e:#}"))?)
+    }))
+}
+
+/// Release a heap string this library allocated.
+///
+/// # Safety
+/// `ptr` must be null (a no-op) or a pointer previously returned by one
+/// of the four allocating calls — `paste_render`, `paste_render_page`,
+/// `paste_combo`, or `paste_combo_conditional` — freed at most once and
+/// never through the caller's own allocator (`free`/`kfree`/etc.). The
+/// string stays valid until this call; copy its contents out first.
 #[no_mangle]
 pub unsafe extern "C" fn paste_free(ptr: *mut c_char) {
     if !ptr.is_null() {
@@ -156,7 +268,7 @@ mod tests {
                     "js/paste.js": {
                         "source": "src/paste.js",
                         "output": "/js/paste.h.v1.min.js",
-                        "hash": "h",
+                        "hash": "7e9e92b0857c477a6e8aebb0ab2bd924",
                         "version": 1,
                         "timestamp": "2026-01-01T00:00:00Z",
                         "dependencies": [],
@@ -165,7 +277,7 @@ mod tests {
                     "js/app.js": {
                         "source": "src/app.js",
                         "output": "/js/app.h.v1.min.js",
-                        "hash": "h",
+                        "hash": "0bdbb2c325525e986d55ef50ca66d056",
                         "version": 1,
                         "timestamp": "2026-01-01T00:00:00Z",
                         "dependencies": [],
@@ -194,6 +306,37 @@ mod tests {
         }))
         .unwrap();
         assert!(envelope["ok"].as_str().unwrap().contains("app+v1.0"));
+    }
+
+    #[test]
+    fn render_rejects_misspelled_jam_options() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = cstring(&fixture(root.path()));
+        // The FFI boundary is raw caller JSON — a misspelled option must
+        // come back as an error envelope, never silently default.
+        for events in [
+            r#"{"events":[{"jam":{"js":["app"],"per_module":true}},{"dump":"js"}]}"#,
+            r#"{"events":[{"jam":{"js":["app"],"sycn":true}},{"dump":"js"}]}"#,
+        ] {
+            let events = cstring(events);
+            let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+                paste_render(settings.as_ptr(), events.as_ptr())
+            }))
+            .unwrap();
+            let error = envelope["error"].as_str().unwrap_or("");
+            assert!(error.contains("unknown field"), "got: {envelope}");
+        }
+        // The real spelling still selects per-module delivery.
+        let events =
+            cstring(r#"{"events":[{"jam":{"js":["app"],"perModule":true}},{"dump":"js"}]}"#);
+        let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_render(settings.as_ptr(), events.as_ptr())
+        }))
+        .unwrap();
+        assert!(
+            envelope["ok"].as_str().unwrap().contains("app.h.v1.min.js"),
+            "got: {envelope}"
+        );
     }
 
     #[test]
@@ -251,6 +394,44 @@ mod tests {
             "/paste/1767225600/app+v1.0.min.js"
         );
         assert_eq!(envelope["ok"]["body"], "");
+    }
+
+    #[test]
+    fn combo_conditional_forwards_the_validator_and_tolerates_null() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = cstring(&fixture(root.path()));
+        let url = cstring("/paste/1767225600/app+v1.0.min.js");
+        let stamp = "Thu, 01 Jan 2026 00:00:00 GMT"; // the fixture's
+
+        // A matching validator → the 304 record, stamped and empty.
+        let ims = cstring(stamp);
+        let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_combo_conditional(settings.as_ptr(), url.as_ptr(), ims.as_ptr())
+        }))
+        .unwrap();
+        assert_eq!(envelope["ok"]["status"], 304);
+        assert_eq!(envelope["ok"]["body"], "");
+        assert_eq!(envelope["ok"]["lastModified"], stamp);
+
+        // A stale one → the ordinary 200, still stamped.
+        let ims = cstring("Wed, 01 Jan 2025 00:00:00 GMT");
+        let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_combo_conditional(settings.as_ptr(), url.as_ptr(), ims.as_ptr())
+        }))
+        .unwrap();
+        assert_eq!(envelope["ok"]["status"], 200);
+        assert_eq!(envelope["ok"]["body"], "APP");
+        assert_eq!(envelope["ok"]["lastModified"], stamp);
+
+        // A NULL or empty validator behaves exactly like paste_combo.
+        for ims in [ptr::null(), cstring("").as_ptr()] {
+            let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+                paste_combo_conditional(settings.as_ptr(), url.as_ptr(), ims)
+            }))
+            .unwrap();
+            assert_eq!(envelope["ok"]["status"], 200);
+            assert_eq!(envelope["ok"]["body"], "APP");
+        }
     }
 
     #[test]
@@ -314,6 +495,73 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn render_page_issues_and_validates_a_generation_token() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = cstring(&fixture(root.path()));
+        let events = cstring(r#"{"events":[{"jam":{"js":["app"]}},{"dump":"js"}]}"#);
+        let empty = cstring("");
+
+        // An empty generation asks for whatever the manifest is now — the
+        // reply issues the token the page stores.
+        let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_render_page(settings.as_ptr(), events.as_ptr(), empty.as_ptr())
+        }))
+        .unwrap();
+        assert!(envelope["ok"]["html"]
+            .as_str()
+            .unwrap()
+            .contains("app+v1.0"));
+        let generation = envelope["ok"]["generation"].as_str().unwrap().to_string();
+        assert!(!generation.is_empty());
+
+        // NULL means the same as the empty string.
+        let null_envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_render_page(settings.as_ptr(), events.as_ptr(), std::ptr::null())
+        }))
+        .unwrap();
+        assert_eq!(null_envelope["ok"]["generation"], generation);
+
+        // Posting the issued token back validates.
+        let pinned = cstring(&generation);
+        let again: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_render_page(settings.as_ptr(), events.as_ptr(), pinned.as_ptr())
+        }))
+        .unwrap();
+        assert_eq!(again["ok"]["generation"], generation);
+
+        // A token that matches nothing is a manifest-generation failure.
+        let stale = cstring("deadbeefdeadbeefdeadbeefdeadbeef");
+        let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_render_page(settings.as_ptr(), events.as_ptr(), stale.as_ptr())
+        }))
+        .unwrap();
+        assert_eq!(envelope["kind"], "manifest-generation");
+        assert!(envelope["error"].as_str().unwrap().contains("generation"));
+
+        // A manifest rewrite mid-page invalidates a previously valid
+        // token — bump mtime past filesystem granularity so the cache
+        // cannot answer the old bytes.
+        std::fs::write(
+            root.path().join("manifest.json"),
+            std::fs::read_to_string(root.path().join("manifest.json"))
+                .unwrap()
+                .replace("\"version\": \"42\"", "\"version\": \"43\""),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(root.path().join("manifest.json"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&take(unsafe {
+            paste_render_page(settings.as_ptr(), events.as_ptr(), pinned.as_ptr())
+        }))
+        .unwrap();
+        assert_eq!(envelope["kind"], "manifest-generation");
     }
 
     #[test]
