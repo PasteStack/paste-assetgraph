@@ -158,8 +158,8 @@ build-rust:
       # under their basenames by the release recipe's extra-assets input
       # (declared on the release-assets job below) and covered by the
       # same SHA256SUMS a downloader verifies the binaries with.
-      cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md .release-assets/
-      (cd .release-assets && sha256sum -- "${TOMSHLEY_CICD_CARGO_BINARY}"-* LICENSE NOTICE.md THIRD_PARTY_LICENSES.md) > SHA256SUMS
+      cp LICENSE NOTICE THIRD_PARTY_LICENSES.md .release-assets/
+      (cd .release-assets && sha256sum -- "${TOMSHLEY_CICD_CARGO_BINARY}"-* LICENSE NOTICE THIRD_PARTY_LICENSES.md) > SHA256SUMS
       # Candidate↔checksum parity: every uploaded file has exactly one entry
       # and every entry names an uploaded file.
       staged="$(cd .release-assets && ls | sort)"
@@ -271,7 +271,7 @@ build-sbt:
         [ "$found" -eq 1 ] || { echo "ERROR: expected artifact produced nothing: ${spec}"; status=1; }
       done
       for jar in $jars; do
-        for entry in LICENSE NOTICE.md THIRD_PARTY_LICENSES.md; do
+        for entry in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
           meta="META-INF/${entry%.md}"
           if ! unzip -p "$jar" "$meta" | diff -q - "$entry" > /dev/null; then
             echo "ERROR: $jar does not carry $entry at $meta (or it diverges)"
@@ -311,7 +311,7 @@ test-node:
   script:
     - cp -R runtime/native/native-lib runtime/node/native-lib
     # The package must carry the legal files the publish job copies in.
-    - cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md runtime/node/
+    - cp LICENSE NOTICE THIRD_PARTY_LICENSES.md runtime/node/
     - node scripts/check_npm_package_legal.cjs
     - cd runtime/node
     - npm ci
@@ -324,7 +324,7 @@ test-python:
   needs: [build-rust]
   script:
     - cp -R runtime/native/native-lib runtime/python/src/paste_assetgraph/native-lib
-    - cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md runtime/python/
+    - cp LICENSE NOTICE THIRD_PARTY_LICENSES.md runtime/python/
     # The wheel must carry the legal files under its dist-info.
     - python scripts/check_wheel_legal.py
     - python -m pip install --no-cache-dir ./runtime/python
@@ -443,7 +443,7 @@ publish-npm:
   needs: [lint-rust, msrv-rust, build-rust, test-rust, test-node, test-node-musl, determinism-linux, determinism-windows]
   script:
     - cp -R runtime/native/native-lib runtime/node/native-lib
-    - cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md runtime/node/
+    - cp LICENSE NOTICE THIRD_PARTY_LICENSES.md runtime/node/
     - cd runtime/node
     - !reference [.tomshley-cicd-publish-npm, script]
 
@@ -454,7 +454,7 @@ publish-python:
     TOMSHLEY_CICD_PYPI_PACKAGE: paste-assetgraph
   script:
     - cp -R runtime/native/native-lib runtime/python/src/paste_assetgraph/native-lib
-    - cp LICENSE NOTICE.md THIRD_PARTY_LICENSES.md runtime/python/
+    - cp LICENSE NOTICE THIRD_PARTY_LICENSES.md runtime/python/
     - cd runtime/python
     - !reference [.tomshley-cicd-publish-python, script]
 
@@ -463,4 +463,4 @@ release-assets:
   needs: [lint-rust, msrv-rust, build-rust, test-rust, test-node, test-node-musl, test-python, test-python-musl, determinism-linux, determinism-windows]
   variables:
     TOMSHLEY_CICD_RELEASE_CHECKSUM_FILE: SHA256SUMS
-    TOMSHLEY_CICD_RELEASE_EXTRA_ASSETS: "LICENSE NOTICE.md THIRD_PARTY_LICENSES.md"
+    TOMSHLEY_CICD_RELEASE_EXTRA_ASSETS: "LICENSE NOTICE THIRD_PARTY_LICENSES.md"

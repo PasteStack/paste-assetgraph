@@ -43,10 +43,10 @@ runtime/python/BUILD_VERSION
 # The publish jobs stage the repository's license texts beside each package
 # manifest; the committed copies live only at the repository root.
 runtime/node/LICENSE
-runtime/node/NOTICE.md
+runtime/node/NOTICE
 runtime/node/THIRD_PARTY_LICENSES.md
 runtime/python/LICENSE
-runtime/python/NOTICE.md
+runtime/python/NOTICE
 runtime/python/THIRD_PARTY_LICENSES.md
 
 # The macOS SDK cache and fresh extraction used by the Darwin build job

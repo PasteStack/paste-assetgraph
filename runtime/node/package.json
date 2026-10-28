@@ -17,7 +17,7 @@
     "index.js",
     "native-lib/",
     "LICENSE",
-    "NOTICE.md",
+    "NOTICE",
     "THIRD_PARTY_LICENSES.md"
   ],
   "dependencies": {

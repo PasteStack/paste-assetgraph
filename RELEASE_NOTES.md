@@ -1,3 +1,13 @@
+# paste-assetgraph v0.4.2
+
+**Date:** 2026-10-28
+
+## Changed
+
+- Apache License 2.0 applied consistently: verbatim LICENSE text, NOTICE rename, Apache short header in every first-party source file, corrected license metadata.
+
+---
+
 # paste-assetgraph v0.4.1
 
 **Date:** 2026-10-22
@@ -154,7 +164,7 @@
 
 ## Licensing
 
-- Licensed under the Apache License, Version 2.0 (`LICENSE`, `NOTICE.md`). The
+- Licensed under the Apache License, Version 2.0 (`LICENSE`, `NOTICE`). The
   Cargo and sbt package metadata previously named a different license.
 
 # paste-assetgraph v0.1.0
