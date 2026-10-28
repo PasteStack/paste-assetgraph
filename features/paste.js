@@ -1,5 +1,5 @@
 /*!
- * Copyright (c) 2025–present Tomshley LLC
+ * Copyright (c) 2017–present Tomshley LLC
  * GitHub: https://github.com/sgoggles
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
