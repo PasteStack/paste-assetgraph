@@ -584,4 +584,4 @@ browser or HTTP deployment.
 
 ## License
 
-Apache License, Version 2.0. See `LICENSE` and `NOTICE.md`.
+Apache License, Version 2.0. See `LICENSE` and `NOTICE`.

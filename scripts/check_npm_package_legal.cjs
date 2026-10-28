@@ -1,7 +1,22 @@
+/*!
+ * Copyright (c) 2017–present Tomshley LLC
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // Fail unless the packed npm runtime carries the repository's legal files.
 //
 // The npm package bundles the native library, so it must ship LICENSE,
-// NOTICE.md and THIRD_PARTY_LICENSES.md byte-identical to the repository
+// NOTICE and THIRD_PARTY_LICENSES.md byte-identical to the repository
 // root's. The publish job copies them in; this gate packs runtime/node and
 // proves the tarball holds them. Node only, so it runs on every Node image.
 //
@@ -15,7 +30,7 @@ const path = require('node:path');
 const zlib = require('node:zlib');
 
 const root = path.resolve(__dirname, '..');
-const legal = ['LICENSE', 'NOTICE.md', 'THIRD_PARTY_LICENSES.md'];
+const legal = ['LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md'];
 
 // The regular files of a gzipped ustar archive, by name.
 function tarFiles(file) {
