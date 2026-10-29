@@ -1,6 +1,6 @@
 {
   "name": "@pastestack/assetgraph",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Thin loader for the paste-assetgraph native library",
   "type": "module",
   "exports": {
