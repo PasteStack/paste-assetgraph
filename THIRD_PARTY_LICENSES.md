@@ -131,7 +131,7 @@ terms as the crates' own sources and license files record them.
 - License: MIT
 - Source: https://crates.io/crates/bincode/1.3.3
 - Repository: https://github.com/servo/bincode
-- License files: LICENSE (text 14)
+- License files: LICENSE.md (text 14)
 
 ### bitflags 1.3.2
 
@@ -604,7 +604,7 @@ terms as the crates' own sources and license files record them.
 - License: Apache-2.0/MIT
 - Source: https://crates.io/crates/md5/0.7.0
 - Repository: https://github.com/stainless-steel/md5
-- License files: LICENSE (text 60)
+- License files: LICENSE.md (text 60)
 
 ### memchr 2.7.6
 
@@ -1044,7 +1044,7 @@ terms as the crates' own sources and license files record them.
 - License: MIT
 - Source: https://crates.io/crates/ropey/1.6.1
 - Repository: https://github.com/cessen/ropey
-- License files: LICENSE (text 85)
+- License files: LICENSE.md (text 85)
 
 ### rustc-hash 2.1.1
 
