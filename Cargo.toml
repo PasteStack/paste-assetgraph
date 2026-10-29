@@ -13,7 +13,7 @@
 
 [package]
 name = "paste-assetgraph"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 # Matches the Rust toolchain baked into the cicd-runner-sbtrustdockertofu image
 # (base-containers entry-rust). Raising this is a runner change, not a job-time install.
